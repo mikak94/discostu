@@ -160,6 +160,7 @@ enum Message {
     AsioDriver(String),
     AsioBuffer(Choice),
     MicChannel(Choice),
+    MaxVolume(Choice),
     Exclusive(bool),
     Toggle(Toggle, bool),
     ResetProfile,
@@ -498,6 +499,10 @@ impl App {
                 spec.asio_buffer = c.value;
                 engine.set_audio_spec(spec);
             }
+            Message::MaxVolume(c) => {
+                engine.set_max_volume(c.value.unwrap_or(200) as f32 / 100.0);
+                self.refresh();
+            }
             Message::MicChannel(c) => {
                 spec.mic_channel = c.value.map(|v| v as u16);
                 engine.set_audio_spec(spec);
@@ -757,7 +762,7 @@ impl App {
         let mut details = column![
             row![
                 icon(Icon::Headphones, 14.0, MUTED),
-                slider(0.0..=2.0, p.volume, move |v| Message::Volume(id, v)).step(0.01f32).style(theme::volume),
+                slider(0.0..=self.snap.max_volume.max(1.0), p.volume, move |v| Message::Volume(id, v)).step(0.01f32).style(theme::volume),
                 text(format!("{:>3.0}%", p.volume * 100.0)).size(12).color(MUTED).width(36),
             ]
             .spacing(10)
@@ -1288,6 +1293,23 @@ impl App {
         if let Some(e) = &d.error {
             col = col.push(text(e.clone()).size(12).color(RED));
         }
+        let limits: Vec<Choice> =
+            [200, 400, 800].into_iter().map(|p| Choice { value: Some(p), label: format!("{p}%") }).collect();
+        let current = (self.snap.max_volume * 100.0).round() as u32;
+        let selected = limits.iter().find(|c| c.value == Some(current)).cloned();
+        col = col.push(labeled(
+            "Volume limit",
+            pick_list(limits, selected, Message::MaxVolume)
+                .padding([8, 12])
+                .width(Length::Fill)
+                .style(theme::picker)
+                .into(),
+        ));
+        col = col.push(
+            text("How far each person's volume slider goes. Past 200%, the limiter rounds off their loudest moments instead of letting them clip.")
+                .size(11)
+                .color(FAINT),
+        );
         col = col.push(
             row![
                 text("Hear a click or crackle? Save right after it happens.").size(12).color(MUTED).width(Length::Fill),

@@ -1,5 +1,5 @@
 //! `discostu --headless [--share | --share-window <title>] [--watch] [--seconds N]
-//!   [--create-channel <name>] [--join-any] [--diagnostics <after seconds>]
+//!   [--create-channel <name>] [--join-any] [--diagnostics <after seconds>] [--stop-share-after <seconds>]
 //!   [--group <code> | --new-group | --no-group] [--broker <host[:port]> | --no-broker]`
 //!
 //! Runs the engine without a window and prints a status line per second.
@@ -192,6 +192,10 @@ pub fn run(args: &[String]) {
                 Ok(()) => println!("joined {} (hosted by {})", c.name, c.host),
                 Err(e) => println!("join failed: {e}"),
             }
+        }
+        if value("--stop-share-after").and_then(|s| s.parse::<u64>().ok()) == Some(start.elapsed().as_secs()) {
+            engine.stop_share();
+            println!("stopped sharing");
         }
         if value("--diagnostics").and_then(|s| s.parse::<u64>().ok()) == Some(start.elapsed().as_secs()) {
             engine.save_diagnostics();

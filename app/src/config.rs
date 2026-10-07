@@ -46,6 +46,8 @@ pub struct Config {
     /// Channels from before they lived on the broker; handed over on the
     /// first broker connection, then empty.
     pub channels: Vec<Channel>,
+    /// Top of the per-person volume sliders (2.0 = 200%).
+    pub max_volume: f32,
     pub peer_volumes: HashMap<PeerId, f32>,
 }
 
@@ -69,6 +71,7 @@ impl Default for Config {
             broker_pins: HashMap::new(),
             manual_peers: Vec::new(),
             channels: Vec::new(),
+            max_volume: 2.0,
             peer_volumes: HashMap::new(),
         }
     }
