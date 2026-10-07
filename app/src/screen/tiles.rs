@@ -5,12 +5,12 @@
 //! frame, diffed against exactly what that viewer already has.
 
 use std::io::Write;
-use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::net::quic::BlockingSend;
 use crate::protocol::{self, ShareInfo};
 use super::capture::{Capture, MonitorInfo};
 use super::codec::{self, AnalyzedFrame, Cursor};
@@ -114,9 +114,7 @@ impl ShareHub {
     }
 
     /// Serves one viewer until it disconnects or sharing stops.
-    pub fn serve(self: &Arc<Self>, mut stream: TcpStream) {
-        let _ = stream.set_nodelay(true);
-        let _ = socket2::SockRef::from(&stream).set_send_buffer_size(8 << 20);
+    pub fn serve(self: &Arc<Self>, mut stream: BlockingSend) {
         self.viewers.fetch_add(1, Ordering::Relaxed);
         let mut known: Vec<u64> = Vec::new();
         let mut sent_frame = 0u64;
@@ -157,7 +155,7 @@ impl ShareHub {
                 break;
             }
         }
-        let _ = stream.shutdown(Shutdown::Both);
+        stream.close();
         self.viewers.fetch_sub(1, Ordering::Relaxed);
     }
 }

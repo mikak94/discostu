@@ -215,6 +215,15 @@ pub fn divider(_: &Theme) -> container::Style {
     container::Style { background: Some(BORDER.into()), ..Default::default() }
 }
 
+/// A small round status light.
+pub fn dot(c: Color) -> container::Style {
+    container::Style {
+        background: Some(c.into()),
+        border: iced::Border { radius: 4.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
 // --- buttons ----------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]

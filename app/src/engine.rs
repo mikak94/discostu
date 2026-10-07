@@ -5,27 +5,34 @@
 //! snapshot is just a few loads).
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use discostu_proto::broker::{ChannelEntry, Member, Presence, ToBroker};
+use discostu_proto::identity::{self, Group, Identity};
 use parking_lot::{Mutex, RwLock};
+use tokio::sync::mpsc;
 
 use crate::audio::jitter::JitterStats;
 use crate::audio::{AudioSettings, AudioShared, DeviceSpec, DeviceStatus, Driver, NetStats, PeerAudio};
 use crate::config::Config;
-use crate::net;
-use crate::protocol::{self, Channel, ChannelId, ChannelRef, Ctrl, Hello, PeerId, PeerStatus, ShareInfo, StreamKind};
+use crate::net::{self, Link, portmap::PortMap, quic};
+use crate::protocol::{Channel, ChannelId, ChannelRef, Ctrl, PeerId, PeerStatus, ShareInfo};
 use crate::screen::{Hub, HubStats, Source, VideoSink, VideoStats, Viewer};
+
+/// A channel we created stays listed this long before the broker confirms it.
+const PENDING_CHANNEL: Duration = Duration::from_secs(10);
 
 pub struct Peer {
     pub id: PeerId,
-    pub ip: IpAddr,
-    pub tcp_port: u16,
+    /// Where their packets come from (LAN, public, or mapped address).
+    pub addr: SocketAddr,
     pub status: Mutex<PeerStatus>,
-    pub writer: Mutex<TcpStream>,
-    /// Which side opened this control connection (for duplicate resolution).
+    pub conn: quinn::Connection,
+    ctrl: mpsc::UnboundedSender<Ctrl>,
+    /// Which side opened this connection (for duplicate resolution).
     pub initiator: PeerId,
     pub serial: u64,
     pub audio: Arc<PeerAudio>,
@@ -38,29 +45,52 @@ pub struct Peer {
 
 impl Peer {
     pub fn send(&self, msg: &Ctrl) -> bool {
-        let bytes = protocol::encode(msg);
-        protocol::write_frame(&mut *self.writer.lock(), &bytes).is_ok()
+        self.ctrl.send(msg.clone()).is_ok()
     }
 
     pub fn close(&self) {
-        let _ = self.writer.lock().shutdown(std::net::Shutdown::Both);
+        self.conn.close(0u32.into(), b"bye");
+    }
+
+    pub fn link(&self) -> Link {
+        Link(self.conn.clone())
     }
 }
 
 pub struct Discovered {
     pub ip: IpAddr,
-    pub tcp_port: u16,
+    pub port: u16,
     pub first_seen: Instant,
     pub last_seen: Instant,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum BrokerStatus {
+    /// No group code, or no broker configured.
+    #[default]
+    Off,
+    Connecting,
+    /// `observed`: our public address as the broker sees it.
+    Connected { observed: SocketAddr },
+    Failed(String),
+}
+
+/// The running engine, for a clean shutdown when the window closes.
+static RUNNING: Mutex<Option<std::sync::Weak<Engine>>> = Mutex::new(None);
+
+/// Shuts the running engine down (peers told, router mapping removed).
+pub fn shutdown_running() {
+    if let Some(e) = RUNNING.lock().take().and_then(|w| w.upgrade()) {
+        e.shutdown();
+    }
+}
+
 pub struct Engine {
     pub me: PeerId,
-    pub tcp_port: u16,
-    pub udp_port: u16,
-    pub udp: UdpSocket,
+    pub net: quic::Net,
     pub audio: Arc<AudioShared>,
     cfg: Mutex<Config>,
+    group: RwLock<Group>,
     pub peers: RwLock<HashMap<PeerId, Arc<Peer>>>,
     pub connecting: Mutex<HashSet<PeerId>>,
     pub discovered: Mutex<HashMap<PeerId, Discovered>>,
@@ -73,6 +103,19 @@ pub struct Engine {
     channel: Mutex<Option<ChannelRef>>,
     /// One-shot message for the UI (e.g. "channel closed").
     notice: Mutex<Option<String>>,
+    /// Wakes the broker client when the group or broker address changes.
+    pub broker_changed: tokio::sync::Notify,
+    /// Messages to the broker while connected.
+    pub broker_tx: Mutex<Option<mpsc::UnboundedSender<ToBroker>>>,
+    broker_status: Mutex<BrokerStatus>,
+    /// Group members online at the broker (us included).
+    members: Mutex<Vec<Member>>,
+    /// The group's open channels, as last heard from the broker (kept while
+    /// it's briefly unreachable).
+    channels: Mutex<Vec<ChannelEntry>>,
+    /// Ours, created but not yet in a broker update.
+    pending_channels: Mutex<Vec<(Channel, Instant)>>,
+    portmap: Mutex<PortMap>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,7 +136,9 @@ pub struct MeView {
 pub struct PeerView {
     pub id: PeerId,
     pub name: String,
-    pub ip: IpAddr,
+    pub addr: SocketAddr,
+    /// "LAN" or "internet".
+    pub path: &'static str,
     pub muted: bool,
     pub deafened: bool,
     pub sharing: Option<ShareInfo>,
@@ -118,6 +163,23 @@ pub struct ChannelView {
     pub mine: bool,
 }
 
+/// Group members the broker says are online but we have no connection to
+/// (yet, or at all: both behind strict NATs).
+#[derive(Debug, Clone)]
+pub struct WaitingView {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InternetView {
+    /// `XXXX-XXXX-…`, empty without a group.
+    pub group_code: String,
+    pub broker: String,
+    pub status: BrokerStatus,
+    pub portmap: PortMap,
+    pub waiting: Vec<WaitingView>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub me: MeView,
@@ -126,6 +188,7 @@ pub struct Snapshot {
     pub channel: Option<ChannelRef>,
     /// Every open channel: ours first, then by host.
     pub channels: Vec<ChannelView>,
+    pub internet: InternetView,
     pub devices: DeviceStatus,
     pub watching: Option<PeerId>,
     pub video: Option<VideoStats>,
@@ -138,6 +201,13 @@ pub struct Snapshot {
     pub share_audio: bool,
     pub stream_volume: f32,
     pub dsp_load: f32,
+}
+
+fn profile_file(base: &str, ext: &str) -> String {
+    match std::env::var("DISCOSTU_PROFILE") {
+        Ok(p) if !p.is_empty() => format!("{base}-{p}.{ext}"),
+        _ => format!("{base}.{ext}"),
+    }
 }
 
 impl Engine {
@@ -156,31 +226,27 @@ impl Engine {
             });
             cfg.save();
         }
-        let (listener, tcp_port) = net::bind_tcp().map_err(|e| format!("TCP: {e}"))?;
-        let (udp, udp_port) = net::bind_udp().map_err(|e| format!("UDP: {e}"))?;
-        let profile_name = match std::env::var("DISCOSTU_PROFILE") {
-            Ok(p) if !p.is_empty() => format!("voice-profile-{p}.json"),
-            _ => "voice-profile.json".into(),
-        };
+        let identity = Identity::load_or_create(&Config::dir().join(profile_file("identity", "bin")))
+            .map_err(|e| format!("identity: {e}"))?;
+        let net = quic::Net::start(&identity).map_err(|e| format!("network: {e}"))?;
         let audio = AudioShared::start(
-            cfg.id,
-            udp.try_clone().map_err(|e| e.to_string())?,
+            identity.id,
             AudioSettings {
                 spec: device_spec(&cfg),
                 stream_volume: cfg.stream_volume,
                 echo_cancel: cfg.echo_cancel,
                 crosstalk_cancel: cfg.crosstalk_cancel,
                 noise_gate: cfg.noise_gate,
-                profile_path: Config::dir().join(profile_name),
+                profile_path: Config::dir().join(profile_file("voice-profile", "json")),
             },
         );
+        let group = Group::from_code(&cfg.group_code);
         let engine = Arc::new(Self {
-            me: cfg.id,
-            tcp_port,
-            udp_port,
-            udp,
+            me: identity.id,
+            net,
             audio,
             cfg: Mutex::new(cfg),
+            group: RwLock::new(group),
             peers: RwLock::new(HashMap::new()),
             connecting: Mutex::new(HashSet::new()),
             discovered: Mutex::new(HashMap::new()),
@@ -191,31 +257,42 @@ impl Engine {
             deafened: AtomicBool::new(false),
             channel: Mutex::new(None),
             notice: Mutex::new(None),
+            broker_changed: tokio::sync::Notify::new(),
+            broker_tx: Mutex::new(None),
+            broker_status: Mutex::new(BrokerStatus::Off),
+            members: Mutex::new(Vec::new()),
+            channels: Mutex::new(Vec::new()),
+            pending_channels: Mutex::new(Vec::new()),
+            portmap: Mutex::new(PortMap::Trying),
         });
-        net::control::spawn_listener(engine.clone(), listener);
-        net::media::spawn(engine.clone());
+        quic::spawn_accept(engine.clone());
+        net::media::spawn_pinger(engine.clone());
         net::discovery::spawn(engine.clone());
+        net::broker::spawn(engine.clone());
+        net::portmap::spawn(engine.clone());
+        *RUNNING.lock() = Some(Arc::downgrade(&engine));
         Ok(engine)
+    }
+
+    /// Leaves cleanly: tells peers, removes the router port mapping.
+    pub fn shutdown(&self) {
+        for p in self.peers.read().values() {
+            p.send(&Ctrl::Bye);
+        }
+        net::portmap::release();
+        self.net.endpoint.close(0u32.into(), b"bye");
     }
 
     pub fn name(&self) -> String {
         self.cfg.lock().name.clone()
     }
 
-    pub fn manual_peers(&self) -> Vec<String> {
-        self.cfg.lock().manual_peers.clone()
+    pub fn group(&self) -> Group {
+        self.group.read().clone()
     }
 
-    pub fn hello(&self, kind: StreamKind) -> Hello {
-        Hello {
-            magic: protocol::MAGIC,
-            version: protocol::VERSION,
-            id: self.me,
-            name: self.name(),
-            tcp_port: self.tcp_port,
-            udp_port: self.udp_port,
-            kind,
-        }
+    pub fn manual_peers(&self) -> Vec<String> {
+        self.cfg.lock().manual_peers.clone()
     }
 
     pub fn local_status(&self) -> PeerStatus {
@@ -224,7 +301,6 @@ impl Engine {
             muted: self.muted.load(Ordering::Relaxed),
             deafened: self.deafened.load(Ordering::Relaxed),
             sharing: self.share.lock().as_ref().filter(|h| !h.is_stopped()).map(|h| h.info()),
-            hosting: self.cfg.lock().channels.clone(),
             channel: *self.channel.lock(),
         }
     }
@@ -234,36 +310,46 @@ impl Engine {
         for p in self.peers.read().values() {
             p.send(&msg);
         }
+        self.send_presence();
     }
 
     pub fn share_hub(&self) -> Option<Hub> {
         self.share.lock().clone().filter(|h| !h.is_stopped())
     }
 
-    // --- peer lifecycle (called from net threads) -------------------------
+    pub fn notify(&self, msg: String) {
+        *self.notice.lock() = Some(msg);
+    }
 
-    /// Installs a handshaken control connection. Returns the peer if this
-    /// connection won duplicate resolution.
-    pub fn register(&self, hello: &Hello, ip: IpAddr, stream: &TcpStream, initiator: PeerId) -> Option<Arc<Peer>> {
-        let writer = stream.try_clone().ok()?;
-        let _ = writer.set_write_timeout(Some(std::time::Duration::from_secs(1)));
-        let preferred = self.me.min(hello.id);
+    // --- peer lifecycle (called from net tasks) ---------------------------
+
+    /// Installs a handshaken connection. Returns the peer if this connection
+    /// won duplicate resolution.
+    pub fn register(
+        &self,
+        id: PeerId,
+        name: &str,
+        conn: quinn::Connection,
+        ctrl: mpsc::UnboundedSender<Ctrl>,
+        initiator: PeerId,
+    ) -> Option<Arc<Peer>> {
+        let preferred = self.me.min(id);
         let mut peers = self.peers.write();
-        if let Some(existing) = peers.get(&hello.id) {
-            // Both sides apply the same rule, so they keep the same socket.
+        if let Some(existing) = peers.get(&id) {
+            // Both sides apply the same rule, so they keep the same connection.
             if existing.initiator == preferred && initiator != preferred {
                 return None;
             }
             existing.close();
         }
-        let volume = self.cfg.lock().peer_volumes.get(&hello.id).copied().unwrap_or(1.0);
-        let audio = self.audio.add_peer(hello.id, SocketAddr::new(ip, hello.udp_port), volume);
+        let volume = self.cfg.lock().peer_volumes.get(&id).copied().unwrap_or(1.0);
+        let audio = self.audio.add_peer(id, Link(conn.clone()), volume);
         let peer = Arc::new(Peer {
-            id: hello.id,
-            ip,
-            tcp_port: hello.tcp_port,
-            status: Mutex::new(PeerStatus { name: hello.name.clone(), ..Default::default() }),
-            writer: Mutex::new(writer),
+            id,
+            addr: quic::remote_addr(&conn),
+            status: Mutex::new(PeerStatus { name: name.to_string(), ..Default::default() }),
+            conn,
+            ctrl,
             initiator,
             serial: self.serials.fetch_add(1, Ordering::Relaxed),
             audio,
@@ -272,9 +358,9 @@ impl Engine {
             clock_offset_us: Arc::new(AtomicI64::new(0)),
             last_pong_us: AtomicU64::new(crate::clock::now_us()),
         });
-        peers.insert(hello.id, peer.clone());
+        peers.insert(id, peer.clone());
         drop(peers);
-        self.connecting.lock().remove(&hello.id);
+        self.connecting.lock().remove(&id);
         peer.send(&Ctrl::Status(self.local_status()));
         self.reroute();
         Some(peer)
@@ -310,7 +396,144 @@ impl Engine {
         }
     }
 
+    // --- broker (called from net::broker) ------------------------------------
+
+    /// The group and broker to connect to; `None` without a group code or
+    /// with the broker turned off.
+    pub fn broker_target(&self) -> Option<(Group, String)> {
+        let group = self.group();
+        let broker = self.cfg.lock().broker.trim().to_string();
+        (!group.is_open() && !broker.is_empty()).then_some((group, broker))
+    }
+
+    pub fn broker_pin(&self, broker: &str) -> Option<String> {
+        self.cfg.lock().broker_pins.get(broker).cloned()
+    }
+
+    pub fn set_broker_pin(&self, broker: &str, fingerprint: String) {
+        let mut cfg = self.cfg.lock();
+        cfg.broker_pins.insert(broker.to_string(), fingerprint);
+        cfg.save();
+    }
+
+    pub fn set_broker_status(&self, status: BrokerStatus) {
+        *self.broker_status.lock() = status;
+    }
+
+    pub fn on_broker_state(&self, members: Vec<Member>, channels: Vec<ChannelEntry>) {
+        self.pending_channels.lock().retain(|(c, at)| {
+            at.elapsed() < PENDING_CHANNEL && !channels.iter().any(|e| e.owner == self.me && e.channel.id == c.id)
+        });
+        *self.members.lock() = members;
+        *self.channels.lock() = channels;
+        self.reroute();
+    }
+
+    pub fn on_broker_lost(&self) {
+        self.members.lock().clear();
+        *self.broker_tx.lock() = None;
+    }
+
+    pub fn broker_members(&self) -> Vec<Member> {
+        self.members.lock().clone()
+    }
+
+    /// What the group should know about us.
+    pub fn presence(&self) -> Presence {
+        let port = self.net.port;
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        if let PortMap::Mapped { addr: a, .. } = *self.portmap.lock() {
+            addrs.push(a);
+        }
+        addrs.extend(net::local_ipv4s().into_iter().map(|ip| SocketAddr::new(ip, port)));
+        if self.net.ipv6 {
+            addrs.extend(net::global_ipv6s().into_iter().map(|ip| SocketAddr::new(ip, port)));
+        }
+        Presence { name: self.name(), addrs, channel: *self.channel.lock() }
+    }
+
+    fn send_presence(&self) {
+        if let Some(tx) = self.broker_tx.lock().as_ref() {
+            let _ = tx.send(ToBroker::Presence(self.presence()));
+        }
+    }
+
+    /// Channels from before they lived on the broker: handed over once.
+    pub fn take_legacy_channels(&self) -> Vec<Channel> {
+        let mut cfg = self.cfg.lock();
+        let legacy = std::mem::take(&mut cfg.channels);
+        if !legacy.is_empty() {
+            cfg.save();
+        }
+        legacy
+    }
+
+    pub fn set_portmap(&self, state: PortMap) {
+        let changed = {
+            let mut p = self.portmap.lock();
+            let changed = *p != state;
+            *p = state;
+            changed
+        };
+        if changed {
+            self.send_presence();
+        }
+    }
+
     // --- UI actions ---------------------------------------------------------
+
+    /// Joins the friends group with this code (empty: LAN only, no group).
+    /// Drops current connections: they belong to the old group.
+    pub fn set_group_code(&self, code: &str) {
+        let group = Group::from_code(code);
+        {
+            let mut cfg = self.cfg.lock();
+            if cfg.group_code == group.code {
+                return;
+            }
+            cfg.group_code = group.code.clone();
+            cfg.save();
+        }
+        *self.group.write() = group;
+        *self.channel.lock() = None;
+        self.channels.lock().clear();
+        self.pending_channels.lock().clear();
+        self.members.lock().clear();
+        for p in self.peers.read().values() {
+            p.close();
+        }
+        self.broker_changed.notify_one();
+    }
+
+    /// Starts a new group with a fresh code and returns it.
+    pub fn new_group(&self) -> String {
+        let code = identity::new_code();
+        self.set_group_code(&code);
+        code
+    }
+
+    pub fn set_broker(&self, address: &str) {
+        {
+            let mut cfg = self.cfg.lock();
+            let address = address.trim();
+            if cfg.broker == address {
+                return;
+            }
+            cfg.broker = address.to_string();
+            cfg.save();
+        }
+        self.broker_changed.notify_one();
+    }
+
+    /// Forgets the remembered broker key (after redeploying the broker).
+    pub fn forget_broker_key(&self) {
+        let mut cfg = self.cfg.lock();
+        let broker = cfg.broker.trim().to_string();
+        cfg.broker_pins.remove(&broker);
+        cfg.save();
+        drop(cfg);
+        self.broker_changed.notify_one();
+    }
 
     /// Moves us to `to` (`None` = the lobby) if that channel is open.
     pub fn join(&self, to: Option<ChannelRef>) -> Result<(), String> {
@@ -325,26 +548,30 @@ impl Engine {
         Ok(())
     }
 
-    /// Creates a channel we host, saves it, and moves us into it.
+    /// Creates a channel (kept by the broker for the group) and moves us in.
     pub fn create_channel(&self, name: &str) -> Result<(), String> {
         let name: String = name.trim().chars().take(32).collect();
         if name.is_empty() {
             return Err("give it a name".into());
         }
-        let id = crate::config::random_id();
-        let mut cfg = self.cfg.lock();
-        cfg.channels.push(Channel { id, name });
-        cfg.save();
-        drop(cfg);
+        let channel = Channel { id: identity::random_u64(), name };
+        {
+            let tx = self.broker_tx.lock();
+            let tx = tx.as_ref().ok_or("channels live on the broker: set a group code and get connected first")?;
+            let _ = tx.send(ToBroker::CreateChannel(channel.clone()));
+        }
+        let id = channel.id;
+        self.pending_channels.lock().push((channel, Instant::now()));
         self.join(Some(ChannelRef { owner: self.me, id }))
     }
 
     /// Deletes one of our channels for good; anyone in it drops to the lobby.
     pub fn delete_channel(&self, id: ChannelId) {
-        let mut cfg = self.cfg.lock();
-        cfg.channels.retain(|c| c.id != id);
-        cfg.save();
-        drop(cfg);
+        if let Some(tx) = self.broker_tx.lock().as_ref() {
+            let _ = tx.send(ToBroker::DeleteChannel(id));
+        }
+        self.channels.lock().retain(|e| !(e.owner == self.me && e.channel.id == id));
+        self.pending_channels.lock().retain(|(c, _)| c.id != id);
         self.reroute();
         self.broadcast_status();
     }
@@ -353,19 +580,16 @@ impl Engine {
         self.notice.lock().take()
     }
 
-    /// Open = its host is online (us, or a connected peer announcing it).
+    /// Open = the broker lists it (its owner is online), or we just made it.
     fn channel_open(&self, r: ChannelRef) -> bool {
-        if r.owner == self.me {
-            return self.cfg.lock().channels.iter().any(|c| c.id == r.id);
+        if r.owner == self.me && self.pending_channels.lock().iter().any(|(c, _)| c.id == r.id) {
+            return true;
         }
-        self.peers
-            .read()
-            .get(&r.owner)
-            .is_some_and(|p| p.status.lock().hosting.iter().any(|c| c.id == r.id))
+        self.channels.lock().iter().any(|e| e.owner == r.owner && e.channel.id == r.id)
     }
 
-    /// Recomputes who we exchange voice with. If our channel closed (its host
-    /// left or deleted it), drops us back to the lobby.
+    /// Recomputes who we exchange voice with. If our channel closed (its
+    /// owner left or deleted it), drops us back to the lobby.
     fn reroute(&self) {
         let current = *self.channel.lock();
         let mut here = current;
@@ -374,7 +598,7 @@ impl Engine {
         {
             here = None;
             *self.channel.lock() = None;
-            *self.notice.lock() = Some("The channel closed: its host left. You're back in the lobby.".into());
+            *self.notice.lock() = Some("The channel closed: its owner left. You're back in the lobby.".into());
         }
         for p in self.peers.read().values() {
             p.audio.set_in_channel(p.status.lock().channel == here);
@@ -384,34 +608,40 @@ impl Engine {
         }
     }
 
+    fn name_of(&self, id: PeerId) -> String {
+        if id == self.me {
+            return self.name();
+        }
+        if let Some(p) = self.peers.read().get(&id) {
+            return p.status.lock().name.clone();
+        }
+        self.members.lock().iter().find(|m| m.id == id).map_or_else(|| "someone".into(), |m| m.name.clone())
+    }
+
     fn channel_views(&self) -> Vec<ChannelView> {
-        let me = self.name();
-        let mut out: Vec<ChannelView> = self
-            .cfg
-            .lock()
-            .channels
-            .iter()
-            .map(|c| ChannelView {
-                at: ChannelRef { owner: self.me, id: c.id },
-                name: c.name.clone(),
-                host: me.clone(),
-                mine: true,
+        let mut all: Vec<(PeerId, Channel)> =
+            self.channels.lock().iter().map(|e| (e.owner, e.channel.clone())).collect();
+        for (c, _) in self.pending_channels.lock().iter() {
+            if !all.iter().any(|(o, x)| *o == self.me && x.id == c.id) {
+                all.push((self.me, c.clone()));
+            }
+        }
+        let mut out: Vec<ChannelView> = all
+            .into_iter()
+            .map(|(owner, c)| ChannelView {
+                at: ChannelRef { owner, id: c.id },
+                name: c.name,
+                host: self.name_of(owner),
+                mine: owner == self.me,
             })
             .collect();
-        let mut theirs = Vec::new();
-        for p in self.peers.read().values() {
-            let st = p.status.lock();
-            theirs.extend(st.hosting.iter().map(|c| ChannelView {
-                at: ChannelRef { owner: p.id, id: c.id },
-                name: c.name.clone(),
-                host: st.name.clone(),
-                mine: false,
-            }));
-        }
-        theirs.sort_by(|a, b| {
-            (a.host.to_lowercase(), a.name.to_lowercase()).cmp(&(b.host.to_lowercase(), b.name.to_lowercase()))
+        out.sort_by(|a, b| {
+            (!a.mine, a.host.to_lowercase(), a.name.to_lowercase()).cmp(&(
+                !b.mine,
+                b.host.to_lowercase(),
+                b.name.to_lowercase(),
+            ))
         });
-        out.extend(theirs);
         out
     }
 
@@ -443,7 +673,7 @@ impl Engine {
     pub fn start_share(&self, source: &Source) -> Result<Option<String>, String> {
         self.stop_share();
         let audio = self.cfg.lock().share_audio;
-        let (hub, warning) = Hub::start(source, audio, self.me, &self.udp)?;
+        let (hub, warning) = Hub::start(source, audio, self.me)?;
         *self.share.lock() = Some(hub);
         self.broadcast_status();
         Ok(warning)
@@ -456,13 +686,11 @@ impl Engine {
         }
     }
 
-    pub fn watch(&self, id: PeerId) -> Result<(), String> {
+    /// Opens a second connection to the peer for their screen (blocking).
+    pub fn watch(self: &Arc<Self>, id: PeerId) -> Result<(), String> {
         let peer = self.peers.read().get(&id).cloned().ok_or("peer is gone")?;
-        let viewer = Viewer::connect(
-            SocketAddr::new(peer.ip, peer.tcp_port),
-            self.hello(StreamKind::Screen),
-            peer.clock_offset_us.clone(),
-        )?;
+        let (conn, send, recv) = net::block_on(quic::open_screen(self.clone(), peer.addr, id))?;
+        let viewer = Viewer::start(conn, send, recv, peer.clock_offset_us.clone())?;
         *self.watching.lock() = Some((id, viewer));
         Ok(())
     }
@@ -543,8 +771,7 @@ impl Engine {
                 .peers
                 .read()
                 .values()
-                .map(|p| format!("{:016x} {}
-", p.id, p.status.lock().name))
+                .map(|p| format!("{:016x} {} {}\n", p.id, p.status.lock().name, p.addr))
                 .collect();
             let _ = std::fs::write(dir.join("peers.txt"), names);
         }
@@ -554,13 +781,10 @@ impl Engine {
     /// Connects to `host[:port]` and remembers it for automatic reconnects.
     pub fn connect_manual(self: &Arc<Self>, target: &str) -> Result<(), String> {
         let target = target.trim();
-        let with_port =
-            if target.contains(':') { target.to_string() } else { format!("{target}:{}", protocol::DEFAULT_TCP_PORT) };
-        let addr = with_port
-            .to_socket_addrs()
-            .map_err(|e| e.to_string())?
-            .find(|a| a.is_ipv4())
-            .ok_or("could not resolve address")?;
+        let addrs = net::discovery::resolve(target);
+        if addrs.is_empty() {
+            return Err("could not resolve address".into());
+        }
         {
             let mut cfg = self.cfg.lock();
             if !cfg.manual_peers.iter().any(|p| p == target) {
@@ -568,12 +792,35 @@ impl Engine {
                 cfg.save();
             }
         }
-        net::control::connect(self.clone(), addr, None);
+        quic::dial(self, addrs, None);
         Ok(())
     }
 
     pub fn is_connected_to(&self, addr: SocketAddr) -> bool {
-        self.peers.read().values().any(|p| p.ip == addr.ip() && p.tcp_port == addr.port())
+        let addr = net::unmap(addr);
+        self.peers.read().values().any(|p| p.addr == addr)
+    }
+
+    fn internet_view(&self) -> InternetView {
+        let cfg = self.cfg.lock();
+        let group_code = identity::pretty_code(&cfg.group_code);
+        let broker = cfg.broker.clone();
+        drop(cfg);
+        let peers = self.peers.read();
+        let waiting = self
+            .members
+            .lock()
+            .iter()
+            .filter(|m| m.id != self.me && !peers.contains_key(&m.id))
+            .map(|m| WaitingView { name: m.name.clone() })
+            .collect();
+        InternetView {
+            group_code,
+            broker,
+            status: self.broker_status.lock().clone(),
+            portmap: self.portmap.lock().clone(),
+            waiting,
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -604,7 +851,8 @@ impl Engine {
                 PeerView {
                     id: p.id,
                     name: st.name,
-                    ip: p.ip,
+                    addr: p.addr,
+                    path: if net::is_private(p.addr.ip()) { "LAN" } else { "internet" },
                     muted: st.muted,
                     deafened: st.deafened,
                     sharing: st.sharing,
@@ -635,16 +883,18 @@ impl Engine {
             None => (None, None),
         };
         let channels = self.channel_views();
+        let internet = self.internet_view();
         let cfg = self.cfg.lock();
         Snapshot {
             me,
             peers,
             channel: *self.channel.lock(),
             channels,
+            internet,
             devices: a.status.lock().clone(),
             watching,
             video,
-            addresses: net::local_ipv4s().iter().map(|ip| format!("{ip}:{}", self.tcp_port)).collect(),
+            addresses: net::local_ipv4s().iter().map(|ip| format!("{ip}:{}", self.net.port)).collect(),
             playback_underruns: a.playback_underruns(),
             send_errors: a.send_errors(),
             echo_cancel: cfg.echo_cancel,

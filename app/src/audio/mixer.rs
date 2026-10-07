@@ -393,7 +393,7 @@ impl Mixer {
                 // Voice only flows within a channel. Everyone else is silence
                 // here (their screen-share audio below still plays if we watch).
                 let in_channel = peer.in_channel();
-                if in_channel && sh.socket.send_to(&self.packet, peer.udp).is_err() {
+                if in_channel && !peer.link.send(&self.packet) {
                     sh.counters.send_errors.fetch_add(1, Ordering::Relaxed);
                 }
                 let pd = self.peers.entry(peer.id).or_insert_with(PeerDsp::new);

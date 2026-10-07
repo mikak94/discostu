@@ -1,5 +1,6 @@
 //! `discostu --headless [--share | --share-window <title>] [--watch] [--seconds N]
-//!   [--create-channel <name>] [--join-any] [--diagnostics <after seconds>]`
+//!   [--create-channel <name>] [--join-any] [--diagnostics <after seconds>]
+//!   [--group <code> | --new-group | --no-group] [--broker <host[:port]> | --no-broker]`
 //!
 //! Runs the engine without a window and prints a status line per second.
 //! Handy for diagnosing networks and for testing two instances on one
@@ -23,22 +24,32 @@ pub fn run(args: &[String]) {
             std::process::exit(1);
         }
     };
+    if let Some(b) = value("--broker") {
+        engine.set_broker(&b);
+    }
+    if flag("--no-broker") {
+        engine.set_broker("");
+    }
+    if let Some(code) = value("--group") {
+        engine.set_group_code(&code);
+    }
+    if flag("--new-group") {
+        println!("new group {}", engine.new_group());
+    }
+    if flag("--no-group") {
+        engine.set_group_code("");
+    }
     let snap = engine.snapshot();
     println!(
-        "discostu {} ({:016x}) tcp {} udp {} · {}",
+        "discostu {} ({:016x}) udp {} · {} · group {} · broker {}",
         snap.me.name,
         engine.me,
-        engine.tcp_port,
-        engine.udp_port,
-        snap.addresses.join(", ")
+        engine.net.port,
+        snap.addresses.join(", "),
+        if snap.internet.group_code.is_empty() { "-" } else { &snap.internet.group_code },
+        if snap.internet.broker.is_empty() { "off" } else { &snap.internet.broker },
     );
-
-    if let Some(name) = value("--create-channel") {
-        match engine.create_channel(&name) {
-            Ok(()) => println!("hosting channel {name}"),
-            Err(e) => println!("create channel failed: {e}"),
-        }
-    }
+    let mut create = value("--create-channel");
 
     let wanted_window = value("--share-window").map(|s| s.to_lowercase());
     if flag("--share") || wanted_window.is_some() {
@@ -92,10 +103,16 @@ pub fn run(args: &[String]) {
                 if h.audio { " + audio" } else { "" }
             );
         }
+        line += &format!(" | broker {:?} upnp {:?}", s.internet.status, s.internet.portmap);
+        for w in &s.internet.waiting {
+            line += &format!(" | waiting for {}", w.name);
+        }
         for p in &s.peers {
             line += &format!(
-                " | {} rtt {:.3} ms jitter {:.2} ms buf {} | net rx {} lost {} reord {} gaps>10/20/50ms {}/{}/{} max {:.1} ms | jb gap {} underrun {} late {}{}{}",
+                " | {} ({} {}) rtt {:.3} ms jitter {:.2} ms buf {} | net rx {} lost {} reord {} gaps>10/20/50ms {}/{}/{} max {:.1} ms | jb gap {} underrun {} late {}{}{}",
                 p.name,
+                p.path,
+                p.addr,
                 p.rtt_us as f32 / 1000.0,
                 p.jitter.jitter_us / 1000.0,
                 p.jitter.target,
@@ -158,6 +175,15 @@ pub fn run(args: &[String]) {
                 Err(e) => println!("watch failed: {e}"),
             }
         }
+        if let Some(name) = create.as_deref()
+            && matches!(s.internet.status, crate::engine::BrokerStatus::Connected { .. })
+        {
+            match engine.create_channel(name) {
+                Ok(()) => println!("created channel {name}"),
+                Err(e) => println!("create channel failed: {e}"),
+            }
+            create = None;
+        }
         if flag("--join-any")
             && s.channel.is_none()
             && let Some(c) = s.channels.iter().find(|c| !c.mine)
@@ -177,4 +203,5 @@ pub fn run(args: &[String]) {
             break;
         }
     }
+    engine.shutdown();
 }

@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 use crate::audio::Driver;
 use crate::protocol::{Channel, PeerId};
 
+/// The public broker this build connects to unless told otherwise.
+pub const DEFAULT_BROKER: &str = "discostu-broker.fly.dev";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub id: PeerId,
     pub name: String,
     /// `None` until first run picks ASIO when a hardware driver exists.
     pub audio_driver: Option<Driver>,
@@ -33,9 +35,16 @@ pub struct Config {
     pub crosstalk_cancel: bool,
     /// Voice-profile driven noise gate on the microphone.
     pub noise_gate: bool,
+    /// Friends group code (normalized). Empty: no group, LAN only.
+    pub group_code: String,
+    /// `host[:port]` of the broker; empty turns internet connections off.
+    pub broker: String,
+    /// Broker address → certificate fingerprint seen on first connect.
+    pub broker_pins: HashMap<String, String>,
     /// `host[:port]` entries to connect to when broadcast discovery is blocked.
     pub manual_peers: Vec<String>,
-    /// Channels we host: they open whenever we are online.
+    /// Channels from before they lived on the broker; handed over on the
+    /// first broker connection, then empty.
     pub channels: Vec<Channel>,
     pub peer_volumes: HashMap<PeerId, f32>,
 }
@@ -43,7 +52,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            id: random_id(),
             name: default_name(),
             audio_driver: None,
             input_device: None,
@@ -56,6 +64,9 @@ impl Default for Config {
             echo_cancel: true,
             crosstalk_cancel: true,
             noise_gate: true,
+            group_code: String::new(),
+            broker: DEFAULT_BROKER.into(),
+            broker_pins: HashMap::new(),
             manual_peers: Vec::new(),
             channels: Vec::new(),
             peer_volumes: HashMap::new(),
@@ -96,17 +107,6 @@ impl Config {
             let _ = std::fs::write(path, json);
         }
     }
-}
-
-pub fn random_id() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let stack = &nanos as *const _ as usize;
-    let seed = format!("{nanos}-{}-{stack}", std::process::id());
-    xxhash_rust::xxh3::xxh3_64(seed.as_bytes()).max(1)
 }
 
 fn default_name() -> String {

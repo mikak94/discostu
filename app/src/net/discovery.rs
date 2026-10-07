@@ -1,10 +1,12 @@
-//! LAN discovery: periodic UDP broadcast beacons on a well-known port.
+//! LAN discovery: periodic UDP broadcast beacons on a well-known port, and
+//! manually added `host[:port]` peers. Beacons carry the group tag, so only
+//! peers with the same group code dial each other.
 //!
 //! To avoid duplicate connections the peer with the lower id dials; the
 //! other side dials too if nothing arrives within a few seconds (e.g. when
 //! broadcast only works in one direction).
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::engine::{Discovered, Engine};
-use crate::net::{control, local_networks};
+use crate::net::{local_networks, quic};
 use crate::protocol::{self, Beacon, DISCOVERY_PORT};
 
 const BEACON_INTERVAL: Duration = Duration::from_millis(1000);
@@ -55,8 +57,8 @@ fn beacon(engine: &Engine) -> Vec<u8> {
         version: protocol::VERSION,
         id: engine.me,
         name: engine.name(),
-        tcp_port: engine.tcp_port,
-        udp_port: engine.udp_port,
+        port: engine.net.port,
+        group: engine.group().tag,
     })
 }
 
@@ -85,17 +87,28 @@ fn run(engine: Arc<Engine>, sock: UdpSocket) {
     }
 }
 
+/// `host[:port]` → addresses (DNS names resolve here).
+pub fn resolve(target: &str) -> Vec<SocketAddr> {
+    let target = target.trim();
+    // "1.2.3.4:5", "host:5" and "[::1]:5" carry a port; "1.2.3.4", "host"
+    // and "::1" don't.
+    let has_port =
+        target.parse::<SocketAddr>().is_ok() || target.rsplit_once(':').is_some_and(|(h, _)| !h.contains(':'));
+    let with_port = if has_port {
+        target.to_string()
+    } else if target.contains(':') {
+        format!("[{target}]:{}", protocol::DEFAULT_PORT)
+    } else {
+        format!("{target}:{}", protocol::DEFAULT_PORT)
+    };
+    with_port.to_socket_addrs().map(|a| a.collect()).unwrap_or_default()
+}
+
 fn dial_manual(engine: &Arc<Engine>) {
     for target in engine.manual_peers() {
-        let with_port = if target.contains(':') {
-            target.clone()
-        } else {
-            format!("{target}:{}", protocol::DEFAULT_TCP_PORT)
-        };
-        if let Ok(addr) = with_port.parse::<SocketAddr>()
-            && !engine.is_connected_to(addr)
-        {
-            control::connect(engine.clone(), addr, None);
+        let addrs = resolve(&target);
+        if !addrs.iter().any(|a| engine.is_connected_to(*a)) {
+            quic::dial(engine, addrs, None);
         }
     }
 }
@@ -104,17 +117,15 @@ fn on_beacon(engine: &Arc<Engine>, b: Beacon, ip: IpAddr) {
     if b.magic != protocol::MAGIC || b.version != protocol::VERSION || b.id == engine.me {
         return;
     }
+    if b.group != engine.group().tag {
+        return; // someone else's group
+    }
     let now = Instant::now();
     let first_seen = {
         let mut d = engine.discovered.lock();
-        let entry = d.entry(b.id).or_insert(Discovered {
-            ip,
-            tcp_port: b.tcp_port,
-            first_seen: now,
-            last_seen: now,
-        });
+        let entry = d.entry(b.id).or_insert(Discovered { ip, port: b.port, first_seen: now, last_seen: now });
         entry.ip = ip;
-        entry.tcp_port = b.tcp_port;
+        entry.port = b.port;
         entry.last_seen = now;
         entry.first_seen
     };
@@ -122,7 +133,7 @@ fn on_beacon(engine: &Arc<Engine>, b: Beacon, ip: IpAddr) {
         return;
     }
     let should_dial = engine.me < b.id || now.duration_since(first_seen) > FALLBACK_DIAL;
-    if should_dial && engine.connecting.lock().insert(b.id) {
-        control::connect(engine.clone(), SocketAddr::new(ip, b.tcp_port), Some(b.id));
+    if should_dial {
+        quic::dial(engine, vec![SocketAddr::new(ip, b.port)], Some(b.id));
     }
 }

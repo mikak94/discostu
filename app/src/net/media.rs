@@ -1,4 +1,6 @@
-//! UDP: audio receive, and ping/pong for RTT, clock offset and liveness.
+//! QUIC datagrams: audio receive, and ping/pong for RTT and clock offset.
+//! (Liveness is QUIC's job: keep-alives, and a connection dies after six
+//! silent seconds.)
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -6,43 +8,34 @@ use std::thread;
 use std::time::Duration;
 
 use crate::clock;
-use crate::engine::Engine;
+use crate::engine::{Engine, Peer};
 use crate::protocol::{self, Datagram};
 
 const PING_INTERVAL: Duration = Duration::from_millis(250);
-const DEAD_AFTER_US: u64 = 6_000_000;
 
-pub fn spawn(engine: Arc<Engine>) {
-    let e = engine.clone();
-    thread::Builder::new()
-        .name("udp-recv".into())
-        .spawn(move || {
-            let _ = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max);
-            receive(e)
-        })
-        .expect("spawn udp receiver");
-    thread::Builder::new().name("udp-ping".into()).spawn(move || ping(engine)).expect("spawn pinger");
+pub fn spawn_pinger(engine: Arc<Engine>) {
+    thread::Builder::new().name("ping".into()).spawn(move || ping(engine)).expect("spawn pinger");
 }
 
-fn receive(engine: Arc<Engine>) {
-    let mut buf = [0u8; 2048];
+/// Handles one peer's datagrams until its connection closes. The sender
+/// field in each datagram is ignored: the connection says who it is.
+pub async fn receive(engine: Arc<Engine>, peer: Arc<Peer>) {
     let mut out = Vec::with_capacity(64);
-    loop {
-        let Ok((n, from)) = engine.udp.recv_from(&mut buf) else { continue };
-        match Datagram::parse(&buf[..n]) {
-            Some(Datagram::Audio { sender, seq, flags, samples, .. }) => {
-                engine.audio.receive(sender, seq, flags, samples);
+    let link = peer.link();
+    while let Ok(bytes) = peer.conn.read_datagram().await {
+        match Datagram::parse(&bytes) {
+            Some(Datagram::Audio { seq, flags, samples, .. }) => {
+                engine.audio.receive(peer.id, seq, flags, samples);
             }
-            Some(Datagram::Stream { sender, seq, samples }) => {
-                engine.audio.receive_stream(sender, seq, samples);
+            Some(Datagram::Stream { seq, samples, .. }) => {
+                engine.audio.receive_stream(peer.id, seq, samples);
             }
-            Some(Datagram::Ping { t0, .. }) => {
+            Some(Datagram::Ping { t0 }) => {
                 protocol::write_pong(&mut out, engine.me, t0, clock::now_us());
-                let _ = engine.udp.send_to(&out, from);
+                link.send(&out);
             }
-            Some(Datagram::Pong { sender, t0, t_remote }) => {
+            Some(Datagram::Pong { t0, t_remote, .. }) => {
                 let now = clock::now_us();
-                let Some(peer) = engine.peers.read().get(&sender).cloned() else { continue };
                 let rtt = now.saturating_sub(t0);
                 let prev = peer.rtt_us.load(Ordering::Relaxed);
                 let smoothed = if prev == 0 { rtt } else { (prev * 7 + rtt) / 8 };
@@ -72,12 +65,7 @@ fn ping(engine: Arc<Engine>) {
         let peers: Vec<_> = engine.peers.read().values().cloned().collect();
         for p in peers {
             protocol::write_ping(&mut out, engine.me, now);
-            let _ = engine.udp.send_to(&out, p.audio.udp);
-            let silent_for = now.saturating_sub(p.last_pong_us.load(Ordering::Relaxed));
-            if silent_for > DEAD_AFTER_US {
-                // Closing the socket ends the reader, which unregisters.
-                p.close();
-            }
+            p.link().send(&out);
         }
     }
 }
