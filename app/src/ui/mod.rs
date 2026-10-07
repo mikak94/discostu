@@ -161,6 +161,7 @@ enum Message {
     AsioBuffer(Choice),
     MicChannel(Choice),
     MaxVolume(Choice),
+    MicGain(f32),
     Exclusive(bool),
     Toggle(Toggle, bool),
     ResetProfile,
@@ -498,6 +499,10 @@ impl App {
             Message::AsioBuffer(c) => {
                 spec.asio_buffer = c.value;
                 engine.set_audio_spec(spec);
+            }
+            Message::MicGain(db) => {
+                engine.set_mic_gain_db(db);
+                self.refresh();
             }
             Message::MaxVolume(c) => {
                 engine.set_max_volume(c.value.unwrap_or(200) as f32 / 100.0);
@@ -1293,6 +1298,25 @@ impl App {
         if let Some(e) = &d.error {
             col = col.push(text(e.clone()).size(12).color(RED));
         }
+        let gain = self.snap.mic_gain_db;
+        let level_db = 20.0 * self.snap.me.level.max(1e-6).log10();
+        col = col.push(labeled(
+            "Mic gain",
+            row![
+                slider(0.0..=crate::engine::MAX_MIC_GAIN_DB, gain, Message::MicGain).step(1.0f32).style(theme::volume),
+                text(format!("+{gain:.0} dB")).size(12).color(MUTED).width(48),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+        ));
+        col = col.push(labeled("Your level", meter((level_db + 60.0) / 60.0, if level_db > -3.0 { AMBER } else { GREEN })));
+        col = col.push(
+            text("Friends say you're quiet? Turn this up until normal talking fills about half the bar. It's fixed: nothing adjusts it behind your back.")
+                .size(11)
+                .color(FAINT),
+        );
+
         let limits: Vec<Choice> =
             [200, 400, 800].into_iter().map(|p| Choice { value: Some(p), label: format!("{p}%") }).collect();
         let current = (self.snap.max_volume * 100.0).round() as u32;

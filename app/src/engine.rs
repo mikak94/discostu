@@ -22,6 +22,9 @@ use crate::net::{self, Link, portmap::PortMap, quic};
 use crate::protocol::{Channel, ChannelId, ChannelRef, Ctrl, PeerId, PeerStatus, ShareInfo};
 use crate::screen::{Hub, HubStats, Source, VideoSink, VideoStats, Viewer};
 
+/// Most a quiet mic can be boosted.
+pub const MAX_MIC_GAIN_DB: f32 = 30.0;
+
 /// A channel we created stays listed this long before the broker confirms it.
 const PENDING_CHANNEL: Duration = Duration::from_secs(10);
 
@@ -202,6 +205,7 @@ pub struct Snapshot {
     pub stream_volume: f32,
     /// Top of the per-person volume sliders.
     pub max_volume: f32,
+    pub mic_gain_db: f32,
     pub dsp_load: f32,
 }
 
@@ -236,6 +240,7 @@ impl Engine {
             AudioSettings {
                 spec: device_spec(&cfg),
                 stream_volume: cfg.stream_volume,
+                mic_gain_db: cfg.mic_gain_db,
                 echo_cancel: cfg.echo_cancel,
                 crosstalk_cancel: cfg.crosstalk_cancel,
                 noise_gate: cfg.noise_gate,
@@ -757,6 +762,15 @@ impl Engine {
         }
     }
 
+    /// Manual mic boost in dB, applied before all voice processing.
+    pub fn set_mic_gain_db(&self, db: f32) {
+        let db = db.clamp(0.0, MAX_MIC_GAIN_DB);
+        self.audio.mic_gain.store(crate::audio::db_to_gain(db));
+        let mut cfg = self.cfg.lock();
+        cfg.mic_gain_db = db;
+        cfg.save();
+    }
+
     pub fn set_stream_volume(&self, v: f32) {
         self.audio.stream_volume.store(v);
         let mut cfg = self.cfg.lock();
@@ -925,6 +939,7 @@ impl Engine {
             share_audio: cfg.share_audio,
             stream_volume: cfg.stream_volume,
             max_volume: cfg.max_volume,
+            mic_gain_db: cfg.mic_gain_db,
             dsp_load: a.dsp_load.load(),
         }
     }
