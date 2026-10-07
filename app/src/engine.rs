@@ -119,6 +119,8 @@ pub struct Engine {
     /// Ours, created but not yet in a broker update.
     pending_channels: Mutex<Vec<(Channel, Instant)>>,
     portmap: Mutex<PortMap>,
+    /// What the broker last heard from us.
+    last_presence: Mutex<Option<Presence>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,7 +142,7 @@ pub struct PeerView {
     pub id: PeerId,
     pub name: String,
     pub addr: SocketAddr,
-    /// "LAN" or "internet".
+    /// "LAN" or "internet", plus ", IPv6" when connected over IPv6.
     pub path: &'static str,
     pub muted: bool,
     pub deafened: bool,
@@ -181,6 +183,8 @@ pub struct InternetView {
     pub status: BrokerStatus,
     pub portmap: PortMap,
     pub waiting: Vec<WaitingView>,
+    /// Our public IPv6 addresses (empty: the provider gives us none).
+    pub ipv6: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -271,6 +275,7 @@ impl Engine {
             channels: Mutex::new(Vec::new()),
             pending_channels: Mutex::new(Vec::new()),
             portmap: Mutex::new(PortMap::Trying),
+            last_presence: Mutex::new(None),
         });
         quic::spawn_accept(engine.clone());
         net::media::spawn_pinger(engine.clone());
@@ -460,8 +465,18 @@ impl Engine {
     }
 
     fn send_presence(&self) {
+        let presence = self.presence();
         if let Some(tx) = self.broker_tx.lock().as_ref() {
-            let _ = tx.send(ToBroker::Presence(self.presence()));
+            let _ = tx.send(ToBroker::Presence(presence.clone()));
+        }
+        *self.last_presence.lock() = Some(presence);
+    }
+
+    /// Re-announces us if our addresses changed (a new DHCP lease, Windows
+    /// rotating its temporary IPv6 addresses, a network switch).
+    pub fn refresh_presence(&self) {
+        if self.last_presence.lock().as_ref() != Some(&self.presence()) {
+            self.send_presence();
         }
     }
 
@@ -856,6 +871,7 @@ impl Engine {
             status: self.broker_status.lock().clone(),
             portmap: self.portmap.lock().clone(),
             waiting,
+            ipv6: if self.net.ipv6 { net::global_ipv6s() } else { Vec::new() },
         }
     }
 
@@ -888,7 +904,12 @@ impl Engine {
                     id: p.id,
                     name: st.name,
                     addr: p.addr,
-                    path: if net::is_private(p.addr.ip()) { "LAN" } else { "internet" },
+                    path: match (net::is_private(p.addr.ip()), p.addr.is_ipv6()) {
+                        (true, false) => "LAN",
+                        (true, true) => "LAN, IPv6",
+                        (false, false) => "internet",
+                        (false, true) => "internet, IPv6",
+                    },
                     muted: st.muted,
                     deafened: st.deafened,
                     sharing: st.sharing,

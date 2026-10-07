@@ -142,7 +142,10 @@ async fn session(engine: &Arc<Engine>, group: &Group, target: &str) -> Result<()
                     break Err(format!("lost the broker: {e}"));
                 }
             }
-            _ = redial.tick() => dial_members(engine),
+            _ = redial.tick() => {
+                engine.refresh_presence();
+                dial_members(engine);
+            }
             _ = engine.broker_changed.notified() => break Ok(()),
         }
     };
