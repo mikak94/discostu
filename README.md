@@ -91,6 +91,10 @@ cargo run -p discostu-broker                      # locally
 fly deploy . --config broker/fly.toml --dockerfile broker/Dockerfile
 ```
 
+Pushes to `master` that touch `broker/` or `proto/` are tested and deployed
+by `.github/workflows/broker.yml` (needs the `FLY_API_TOKEN` repository
+secret: `fly tokens create deploy -a discostu-broker`).
+
 On Fly.io, UDP needs a dedicated IPv4 (`fly ips allocate-v4`) and binds
 `fly-global-services`; the identity and channels live on a volume
 (`fly volumes create broker_data -s 1`). The app's default broker is
