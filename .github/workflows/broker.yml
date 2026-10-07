@@ -1,0 +1,54 @@
+# Tests the broker (and the protocol crate it shares with the app) on Linux,
+# then deploys it to Fly.io on every push to master that touches it.
+#
+# One-time setup: the Fly app, volume and IPv4 must exist (see README), and
+# the repository needs a FLY_API_TOKEN secret: `fly tokens create deploy -a discostu-broker`.
+name: Broker
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "broker/**"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".dockerignore"
+      - ".github/workflows/broker.yml"
+  pull_request:
+    paths:
+      - "broker/**"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".dockerignore"
+      - ".github/workflows/broker.yml"
+  workflow_dispatch:
+
+# Never two deploys at once; a newer push waits for the running one.
+concurrency:
+  group: broker-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p discostu-proto -p discostu-broker
+      - run: cargo build --locked --release -p discostu-broker
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # Built by Fly's remote builder from broker/Dockerfile, with the whole
+      # workspace as context.
+      - run: flyctl deploy . --config broker/fly.toml --dockerfile broker/Dockerfile --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
