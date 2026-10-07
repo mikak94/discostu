@@ -3,7 +3,7 @@
 //! Signal flow, once per 2.5 ms block on the DSP thread (`mixer`):
 //!
 //! ```text
-//!  mic ─► AEC(ref = last mix) ─► analysis/VAD/profile ─┬─► gate ─► UDP to peers
+//!  mic ─► AEC(ref = last mix) ─► analysis/VAD/profile ─┬─► gate ─► QUIC datagrams to peers
 //!                                                      └─► crosstalk reference
 //!  peer voice ─► jitter ─► crosstalk cancel ─► residual suppress ─► gain ─┐
 //!  peer screen audio (stereo) ─► jitter ─► stream volume ───────────────┐ │
@@ -22,7 +22,7 @@ pub mod wasapi;
 mod mixer;
 mod resample;
 
-use std::net::{SocketAddr, UdpSocket};
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -54,10 +54,11 @@ impl AtomicF32 {
     }
 }
 
-/// Receive-side state for one peer, shared between the UDP and DSP threads.
+/// Receive-side state for one peer, shared between the network and DSP threads.
 pub struct PeerAudio {
     pub id: PeerId,
-    pub udp: SocketAddr,
+    /// Their QUIC connection: our voice goes out on it as datagrams.
+    pub link: crate::net::Link,
     voice: Mutex<JitterBuffer<BLOCK>>,
     stream: Mutex<JitterBuffer<STEREO_BLOCK>>,
     pub volume: AtomicF32,
@@ -133,6 +134,7 @@ impl PeerAudio {
         if on {
             // Their sequence numbers moved on while we weren't listening.
             *self.voice.lock() = JitterBuffer::new(1);
+            *self.net.lock() = NetStats::default();
         } else {
             self.voice_active.store(false, Ordering::Relaxed);
             self.level.store(0.0);
@@ -142,7 +144,7 @@ impl PeerAudio {
 
 pub struct AudioShared {
     me: PeerId,
-    socket: UdpSocket,
+
     peers: RwLock<Vec<Arc<PeerAudio>>>,
     pub muted: AtomicBool,
     pub deafened: AtomicBool,
@@ -177,11 +179,11 @@ pub struct AudioSettings {
 }
 
 impl AudioShared {
-    pub fn start(me: PeerId, socket: UdpSocket, settings: AudioSettings) -> Arc<Self> {
+    pub fn start(me: PeerId, settings: AudioSettings) -> Arc<Self> {
         let (io_tx, io_rx) = crossbeam_channel::bounded(2);
         let shared = Arc::new(Self {
             me,
-            socket,
+
             peers: RwLock::new(Vec::new()),
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
@@ -224,10 +226,10 @@ impl AudioShared {
         shared
     }
 
-    pub fn add_peer(&self, id: PeerId, udp: SocketAddr, volume: f32) -> Arc<PeerAudio> {
+    pub fn add_peer(&self, id: PeerId, link: crate::net::Link, volume: f32) -> Arc<PeerAudio> {
         let peer = Arc::new(PeerAudio {
             id,
-            udp,
+            link,
             voice: Mutex::new(JitterBuffer::new(1)),
             // System audio arrives in 10 ms bursts (the sender's capture period).
             stream: Mutex::new(JitterBuffer::new(2).with_min_target(4)),
@@ -258,7 +260,7 @@ impl AudioShared {
         self.peers.read().iter().find(|p| p.id == id).cloned()
     }
 
-    /// Voice packet from the UDP receive thread.
+    /// Voice packet from the network.
     pub fn receive(&self, sender: PeerId, seq: u32, flags: u8, pcm: &[u8]) {
         let Some(peer) = self.peer(sender) else { return };
         if !peer.in_channel() {

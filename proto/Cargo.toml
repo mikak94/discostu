@@ -1,0 +1,13 @@
+[package]
+name = "discostu-proto"
+version.workspace = true
+edition.workspace = true
+description = "discostu wire formats, identities and QUIC/TLS setup, shared by the app and the broker"
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+ring.workspace = true

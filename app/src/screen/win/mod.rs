@@ -12,7 +12,6 @@ pub mod decoder;
 pub mod encoder;
 
 use std::io::Write;
-use std::net::{Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,6 +24,8 @@ use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint};
 
 use crate::audio::loopback::{self, Loopback};
 use crate::clock;
+use crate::net::Link;
+use crate::net::quic::BlockingSend;
 use crate::protocol::{self, PeerId, ShareInfo};
 use capture::{Target, Wgc};
 use d3d::{D3d, SendCell};
@@ -53,7 +54,7 @@ pub struct VideoHub {
     pub audio: bool,
     key_request: Arc<AtomicBool>,
     queues: Arc<Mutex<Vec<ViewerQueue>>>,
-    audio_targets: Arc<Mutex<Vec<(u64, SocketAddr)>>>,
+    audio_targets: Arc<Mutex<Vec<(u64, Link)>>>,
     next_viewer: AtomicU64,
     _capture: Mutex<Option<SendCell<Wgc>>>,
     _loopback: Mutex<Option<Loopback>>,
@@ -73,7 +74,7 @@ fn bitrate(w: u32, h: u32) -> u32 {
 }
 
 impl VideoHub {
-    pub fn start(source: &Source, share_audio: bool, me: PeerId, socket: &UdpSocket) -> Result<Arc<Self>, String> {
+    pub fn start(source: &Source, share_audio: bool, me: PeerId) -> Result<Arc<Self>, String> {
         let d3d = D3d::new().map_err(|e| format!("Direct3D: {e}"))?;
         let target = match source.kind {
             super::SourceKind::Monitor { handle } => Target::Monitor(handle),
@@ -174,13 +175,12 @@ impl VideoHub {
             });
         }
 
-        let audio_targets: Arc<Mutex<Vec<(u64, SocketAddr)>>> = Arc::new(Mutex::new(Vec::new()));
+        let audio_targets: Arc<Mutex<Vec<(u64, Link)>>> = Arc::new(Mutex::new(Vec::new()));
         let loopback = if share_audio {
             let target = match source.kind {
                 super::SourceKind::Monitor { .. } => loopback::Target::AllExcept(std::process::id()),
                 super::SourceKind::Window { pid, .. } => loopback::Target::Process(pid),
             };
-            let socket = socket.try_clone().map_err(|e| e.to_string())?;
             let targets = audio_targets.clone();
             let mut block = Vec::with_capacity(crate::audio::STEREO_BLOCK);
             let mut packet = Vec::with_capacity(protocol::MAX_DATAGRAM);
@@ -193,8 +193,8 @@ impl VideoHub {
                     if block.len() == crate::audio::STEREO_BLOCK {
                         protocol::write_stream(&mut packet, me, seq, &block);
                         seq = seq.wrapping_add(1);
-                        for (_, addr) in targets.lock().expect("targets").iter() {
-                            let _ = socket.send_to(&packet, addr);
+                        for (_, link) in targets.lock().expect("targets").iter() {
+                            link.send(&packet);
                         }
                         block.clear();
                     }
@@ -254,16 +254,14 @@ impl VideoHub {
     }
 
     /// Serves one viewer until it disconnects or sharing stops.
-    pub fn serve(self: &Arc<Self>, mut stream: TcpStream, audio_to: Option<SocketAddr>) {
-        let _ = stream.set_nodelay(true);
-        let _ = socket2::SockRef::from(&stream).set_send_buffer_size(4 << 20);
+    pub fn serve(self: &Arc<Self>, mut stream: BlockingSend, audio_to: Option<Link>) {
         let id = self.next_viewer.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded::<Arc<EncodedFrame>>(6);
         let resync = Arc::new(AtomicBool::new(false));
         self.queues.lock().expect("queues").push(ViewerQueue { id, tx, waiting_for_key: true, resync: resync.clone() });
         self.key_request.store(true, Ordering::Relaxed);
-        if let Some(addr) = audio_to {
-            self.audio_targets.lock().expect("targets").push((id, addr));
+        if let Some(link) = audio_to {
+            self.audio_targets.lock().expect("targets").push((id, link));
         }
         self.viewers.fetch_add(1, Ordering::Relaxed);
 
@@ -283,7 +281,7 @@ impl VideoHub {
         self.queues.lock().expect("queues").retain(|q| q.id != id);
         self.audio_targets.lock().expect("targets").retain(|(v, _)| *v != id);
         self.viewers.fetch_sub(1, Ordering::Relaxed);
-        let _ = stream.shutdown(Shutdown::Both);
+        stream.close();
     }
 }
 

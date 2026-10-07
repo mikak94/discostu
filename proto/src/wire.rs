@@ -1,11 +1,13 @@
-//! Wire formats.
+//! Peer-to-peer wire formats.
 //!
-//! - Discovery: postcard-encoded [`Beacon`] broadcast over UDP.
-//! - Control / screen TCP streams: `u32 LE length` + payload frames. The first
-//!   frame on every connection is a [`Hello`], after which control streams carry
-//!   [`Ctrl`] messages and screen streams carry `screen::codec` frames.
-//! - Media UDP: hand-rolled fixed layouts (see [`Datagram`]) to keep the audio
-//!   path allocation-free and trivially cheap to parse.
+//! Everything between peers runs over QUIC on one UDP port (see [`crate::tls`]):
+//! - Discovery: postcard-encoded [`Beacon`] broadcast on the LAN (plain UDP,
+//!   only a hint: the QUIC handshake proves who is who).
+//! - Streams: `u32 LE length` + payload frames. The first frame each way is a
+//!   [`Hello`], then control streams carry [`Ctrl`] messages and screen
+//!   streams carry `screen::codec` frames.
+//! - QUIC datagrams: hand-rolled fixed layouts (see [`Datagram`]) to keep the
+//!   audio path allocation-free and trivially cheap to parse.
 
 use std::io::{self, Read, Write};
 
@@ -14,10 +16,10 @@ use serde::{Deserialize, Serialize};
 pub type PeerId = u64;
 
 pub const MAGIC: [u8; 4] = *b"DSTU";
-pub const VERSION: u16 = 2;
+/// Bumped on incompatible changes; also part of the QUIC ALPN.
+pub const VERSION: u16 = 3;
 pub const DISCOVERY_PORT: u16 = 47800;
-pub const DEFAULT_TCP_PORT: u16 = 47801;
-pub const DEFAULT_UDP_PORT: u16 = 47802;
+pub const DEFAULT_PORT: u16 = 47802;
 
 /// Audio is 48 kHz mono, sent in 2.5 ms blocks.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -29,8 +31,9 @@ pub struct Beacon {
     pub version: u16,
     pub id: PeerId,
     pub name: String,
-    pub tcp_port: u16,
-    pub udp_port: u16,
+    pub port: u16,
+    /// [`crate::identity::Group::tag`]: only peers in the same group dial.
+    pub group: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,15 +42,14 @@ pub enum StreamKind {
     Screen,
 }
 
+/// First frame on every stream. Who the sender is comes from its TLS
+/// certificate, not from here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
-    pub magic: [u8; 4],
-    pub version: u16,
-    pub id: PeerId,
     pub name: String,
-    pub tcp_port: u16,
-    pub udp_port: u16,
     pub kind: StreamKind,
+    /// [`crate::identity::Group::proof`] for this connection.
+    pub proof: [u8; 32],
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -59,9 +61,9 @@ pub struct ShareInfo {
 
 pub type ChannelId = u64;
 
-/// A voice channel, hosted by the peer that created it: it exists while its
-/// creator is online and is saved in the creator's config. Membership is
-/// just each peer's [`PeerStatus::channel`]; audio stays peer-to-peer.
+/// A voice channel. The broker keeps them per group and lists one while its
+/// creator is online. Membership is each peer's [`PeerStatus::channel`];
+/// audio stays peer-to-peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
@@ -81,8 +83,6 @@ pub struct PeerStatus {
     pub muted: bool,
     pub deafened: bool,
     pub sharing: Option<ShareInfo>,
-    /// Channels this peer hosts.
-    pub hosting: Vec<Channel>,
     pub channel: Option<ChannelRef>,
 }
 
@@ -100,13 +100,36 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     postcard::from_bytes(bytes).ok()
 }
 
-/// Writes one length-prefixed frame with a single `write_all` so small
-/// control messages leave in one segment (sockets run with TCP_NODELAY).
-pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+fn framed(payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(payload);
-    w.write_all(&buf)
+    buf
+}
+
+/// Writes one length-prefixed frame with a single `write_all` so small
+/// control messages leave in one packet.
+pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+    w.write_all(&framed(payload))
+}
+
+/// [`write_frame`] of an encoded message on a QUIC stream.
+pub async fn send_msg<T: Serialize>(s: &mut quinn::SendStream, msg: &T) -> io::Result<()> {
+    s.write_all(&framed(&encode(msg))).await.map_err(io::Error::other)
+}
+
+/// Reads one frame from a QUIC stream and decodes it; `None` on a closed
+/// stream, an oversized frame or garbage.
+pub async fn recv_msg<T: for<'a> Deserialize<'a>>(r: &mut quinn::RecvStream, max_len: usize) -> Option<T> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len).await.ok()?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > max_len {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf).await.ok()?;
+    decode(&buf)
 }
 
 pub fn read_frame(r: &mut impl Read, buf: &mut Vec<u8>, max_len: usize) -> io::Result<()> {
@@ -121,9 +144,10 @@ pub fn read_frame(r: &mut impl Read, buf: &mut Vec<u8>, max_len: usize) -> io::R
 }
 
 // ---------------------------------------------------------------------------
-// UDP media datagrams
+// QUIC media datagrams
 //
 //   common header: b'D' | kind u8 | sender u64
+//   (`sender` is informational: receivers use the connection's identity)
 //   Audio: seq u32 | capture_us u64 | flags u8 | count u16 | i16 samples
 //   Stream: same as Audio, interleaved stereo samples
 //   Ping:  t0 u64

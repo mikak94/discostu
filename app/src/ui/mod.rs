@@ -17,7 +17,8 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
 use crate::audio::{DeviceSpec, Driver, device};
-use crate::engine::{Engine, PeerView, Snapshot, Toggle};
+use crate::engine::{BrokerStatus, Engine, PeerView, Snapshot, Toggle};
+use crate::net::portmap::PortMap;
 use crate::protocol::{BLOCK, ChannelId, ChannelRef, PeerId, SAMPLE_RATE};
 use crate::screen::{self, Source, VideoSink};
 use icons::{Icon, icon};
@@ -100,6 +101,9 @@ struct App {
     devices: DeviceLists,
     name_draft: String,
     connect_draft: String,
+    /// Friends group code being typed or pasted.
+    group_draft: String,
+    broker_draft: String,
     toast: Option<(String, Instant)>,
     fullscreen: bool,
     /// Last mouse movement: fullscreen controls show for a moment after it.
@@ -142,6 +146,14 @@ enum Message {
     NameSubmit,
     ConnectChanged(String),
     ConnectSubmit,
+    GroupDraft(String),
+    GroupJoin,
+    GroupNew,
+    GroupLeave,
+    CopyGroupCode,
+    BrokerDraft(String),
+    BrokerSubmit,
+    ForgetBrokerKey,
     Driver(Driver),
     InputDevice(String),
     OutputDevice(String),
@@ -195,6 +207,8 @@ impl App {
                 picker_tab: PickerTab::Screens,
                 devices: DeviceLists::default(),
                 name_draft,
+                group_draft: String::new(),
+                broker_draft: String::new(),
                 connect_draft: String::new(),
                 toast: None,
                 fullscreen: false,
@@ -344,6 +358,7 @@ impl App {
             Message::OpenSettings => {
                 self.overlay = Overlay::Settings;
                 self.name_draft = self.snap.me.name.clone();
+                self.broker_draft = self.snap.internet.broker.clone();
                 return Task::perform(blocking(load_devices), Message::Devices);
             }
             Message::Devices(d) => self.devices = d,
@@ -407,6 +422,40 @@ impl App {
             Message::NameSubmit => {
                 engine.set_name(self.name_draft.clone());
                 self.refresh();
+            }
+            Message::GroupDraft(s) => self.group_draft = s,
+            Message::GroupJoin => {
+                let code = std::mem::take(&mut self.group_draft);
+                if discostu_proto::identity::normalize(&code).len() < 8 {
+                    self.toast("That doesn't look like a group code");
+                } else {
+                    engine.set_group_code(&code);
+                    self.toast("Joined the group. Friends in it will show up as they come online.");
+                    self.refresh();
+                }
+            }
+            Message::GroupNew => {
+                engine.new_group();
+                self.refresh();
+                self.toast("New group made. Copy its code and send it to your friends.");
+            }
+            Message::GroupLeave => {
+                engine.set_group_code("");
+                self.refresh();
+                self.toast("Left the group: LAN only now");
+            }
+            Message::CopyGroupCode => {
+                self.toast("Group code copied");
+                return iced::clipboard::write(self.snap.internet.group_code.clone());
+            }
+            Message::BrokerDraft(s) => self.broker_draft = s,
+            Message::BrokerSubmit => {
+                engine.set_broker(&self.broker_draft);
+                self.refresh();
+            }
+            Message::ForgetBrokerKey => {
+                engine.forget_broker_key();
+                self.toast("Forgot the broker's key: the next one it shows will be trusted");
             }
             Message::ConnectChanged(s) => self.connect_draft = s,
             Message::ConnectSubmit => {
@@ -588,8 +637,26 @@ impl App {
         }
         list = list.push(self.channel_block(None, "Lobby", None, false));
         for c in &self.snap.channels {
-            let host = if c.mine { "hosted by you".to_string() } else { format!("hosted by {}", c.host) };
+            let host = if c.mine { "made by you".to_string() } else { format!("made by {}", c.host) };
             list = list.push(self.channel_block(Some(c.at), &c.name, Some(host), c.mine));
+        }
+        let internet = &self.snap.internet;
+        if internet.group_code.is_empty() && self.snap.channels.is_empty() {
+            list = list.push(
+                container(text("Channels and friends outside this network need a group: Settings → Internet.").size(11).color(FAINT))
+                    .padding([6, 10]),
+            );
+        }
+        if !internet.waiting.is_empty() {
+            let mut waiting = column![text("NOT CONNECTED YET").size(10).font(SEMIBOLD).color(FAINT)].spacing(4);
+            for w in &internet.waiting {
+                waiting = waiting.push(
+                    row![icon(Icon::Users, 12.0, FAINT), text(format!("{} · connecting…", w.name)).size(12).color(FAINT)]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                );
+            }
+            list = list.push(container(waiting).padding([10, 10]));
         }
 
         container(
@@ -697,7 +764,7 @@ impl App {
             .align_y(Alignment::Center),
             text(format!(
                 "{} · jitter {:.2} ms → buffer {:.1} ms · lost {} of {} · late bursts {}",
-                p.ip,
+                format!("{} {}", p.path, p.addr),
                 p.jitter.jitter_us / 1000.0,
                 jitter_ms,
                 p.net.expected - p.net.received,
@@ -860,6 +927,7 @@ impl App {
                 Space::new().height(4),
                 text("Nobody's on the dance floor yet").size(22).font(BOLD),
                 text("Anyone running discostu on this LAN shows up here automatically.").size(14).color(MUTED),
+                text("Friends elsewhere: share a group code in Settings → Internet.").size(13).color(MUTED),
                 Space::new().height(6),
                 text(format!("You're reachable at  {addrs}")).size(13).color(FAINT),
                 row![
@@ -1281,6 +1349,8 @@ impl App {
         ]
         .spacing(12);
 
+        let internet = self.internet_settings();
+
         let saved = self.engine.as_ref().map(|e| e.manual_peers()).unwrap_or_default();
         let network = column![
             section("Network"),
@@ -1325,7 +1395,7 @@ impl App {
                 button(icon(Icon::Close, 16.0, MUTED)).padding(6).style(theme::ghost).on_press(Message::CloseOverlay),
             ]
             .align_y(Alignment::Center),
-            scrollable(column![name, audio, voice, network, budget].spacing(26).padding(iced::Padding {
+            scrollable(column![name, audio, voice, internet, network, budget].spacing(26).padding(iced::Padding {
                 right: 12.0,
                 ..iced::Padding::ZERO
             }))
@@ -1336,6 +1406,106 @@ impl App {
     }
 
     /// Where the milliseconds go, mouth to ear, with the current devices.
+    /// Friends group and broker: how people outside this LAN find us.
+    fn internet_settings(&self) -> El<'_> {
+        let i = &self.snap.internet;
+        let mut col = column![section("Internet")].spacing(10);
+        if i.group_code.is_empty() {
+            col = col.push(
+                text(
+                    "To talk with friends outside this network, start a group and send them its code, \
+                     or paste the code a friend sent you. Channels live in the group too.",
+                )
+                .size(13)
+                .color(MUTED),
+            );
+            col = col.push(
+                row![
+                    text_input("Paste a group code", &self.group_draft)
+                        .on_input(Message::GroupDraft)
+                        .on_submit(Message::GroupJoin)
+                        .padding([8, 12])
+                        .size(14)
+                        .style(theme::input),
+                    button(text("Join").size(13)).padding([8, 14]).style(theme::primary).on_press(Message::GroupJoin),
+                    button(text("New group").size(13)).padding([8, 14]).style(theme::ghost).on_press(Message::GroupNew),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        } else {
+            col = col.push(
+                container(
+                    column![
+                        row![
+                            text("Group code").size(12).color(FAINT).width(Length::Fill),
+                            button(text("Copy").size(12)).padding([4, 10]).style(theme::ghost).on_press(Message::CopyGroupCode),
+                            button(text("Leave").size(12)).padding([4, 10]).style(theme::ghost).on_press(Message::GroupLeave),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                        text(i.group_code.clone()).size(22).font(iced::Font::MONOSPACE).color(GOLD),
+                        text("Anyone with this code can join the group: send it only to friends.").size(11).color(FAINT),
+                    ]
+                    .spacing(6),
+                )
+                .padding(14)
+                .style(theme::card),
+            );
+            let (dot, status) = match &i.status {
+                BrokerStatus::Off => (FAINT, "Broker off: LAN only".to_string()),
+                BrokerStatus::Connecting => (GOLD, "Connecting to the broker…".to_string()),
+                BrokerStatus::Connected { observed } => {
+                    (GREEN, format!("Online. The internet sees you at {observed}."))
+                }
+                BrokerStatus::Failed(e) => (RED, e.clone()),
+            };
+            col = col.push(
+                row![container(Space::new()).width(8).height(8).style(move |_| theme::dot(dot)), text(status).size(13).color(MUTED)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            );
+            let upnp = match &i.portmap {
+                PortMap::Trying => "Router port mapping: asking the router…".to_string(),
+                PortMap::Mapped { addr, via } => format!("Router port mapping: open at {addr} ({via}), friends can always reach you."),
+                PortMap::CarrierNat(ip) => format!(
+                    "Router port mapping: your provider puts you behind a shared address ({ip}), so it can't help. \
+                     Direct connections still work unless your friend has the same."
+                ),
+                PortMap::Unavailable(e) => format!("Router port mapping: unavailable ({e}). Hole punching usually works anyway."),
+                PortMap::Disabled => "Router port mapping: off".to_string(),
+            };
+            col = col.push(text(upnp).size(12).color(FAINT));
+        }
+        let broker_failed_key = matches!(&i.status, BrokerStatus::Failed(e) if e.contains("identity changed"));
+        let mut broker_row = row![
+            text("Broker").size(13).color(MUTED).width(60),
+            text_input(crate::config::DEFAULT_BROKER, &self.broker_draft)
+                .on_input(Message::BrokerDraft)
+                .on_submit(Message::BrokerSubmit)
+                .padding([6, 10])
+                .size(13)
+                .style(theme::input),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if self.broker_draft.trim() != i.broker.trim() {
+            broker_row = broker_row.push(button(text("Save").size(12)).padding([6, 12]).style(theme::primary).on_press(Message::BrokerSubmit));
+        }
+        if broker_failed_key {
+            broker_row = broker_row.push(
+                button(text("Trust new key").size(12)).padding([6, 12]).style(theme::ghost).on_press(Message::ForgetBrokerKey),
+            );
+        }
+        col.push(broker_row)
+            .push(
+                text("The broker only introduces you: voice and video always go straight between you and your friends, encrypted.")
+                    .size(11)
+                    .color(FAINT),
+            )
+            .into()
+    }
+
     fn latency_budget(&self) -> El<'_> {
         let d = &self.snap.devices;
         let ms = |frames: usize, rate: u32| (frames > 0).then(|| frames as f32 * 1000.0 / rate.max(1) as f32);

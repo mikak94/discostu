@@ -1,0 +1,31 @@
+# Deploy from the repository root (the broker builds in the workspace):
+#   fly deploy . --config broker/fly.toml --dockerfile broker/Dockerfile
+app = "discostu-broker"
+primary_region = "fra"
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[env]
+  # Fly routes UDP only to this address, not 0.0.0.0.
+  BROKER_BIND = "fly-global-services:47900"
+  BROKER_DATA = "/data"
+
+# UDP needs a dedicated IPv4: fly ips allocate-v4
+[[services]]
+  internal_port = 47900
+  protocol = "udp"
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 47900
+
+# Identity key and channel list survive restarts and redeploys.
+[mounts]
+  source = "broker_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

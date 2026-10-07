@@ -13,7 +13,6 @@ mod tiles;
 #[cfg(windows)]
 pub mod win;
 
-use std::net::{Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +21,8 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::clock;
+use crate::net::Link;
+use crate::net::quic::{BlockingRecv, BlockingSend};
 use crate::protocol::{self, PeerId, ShareInfo};
 use codec::{Cursor, Message, Rect};
 pub use tiles::ShareHub;
@@ -105,11 +106,10 @@ impl Hub {
         source: &Source,
         share_audio: bool,
         me: PeerId,
-        socket: &UdpSocket,
     ) -> Result<(Hub, Option<String>), String> {
         #[cfg(windows)]
         {
-            match win::VideoHub::start(source, share_audio, me, socket) {
+            match win::VideoHub::start(source, share_audio, me) {
                 Ok(h) => return Ok((Hub::Video(h), None)),
                 Err(e) if source.is_window() => return Err(e),
                 Err(e) => {
@@ -121,7 +121,7 @@ impl Hub {
         }
         #[cfg(not(windows))]
         {
-            let _ = (share_audio, me, socket);
+            let _ = (share_audio, me);
             Ok((Self::start_tiles(source)?, None))
         }
     }
@@ -178,7 +178,7 @@ impl Hub {
         }
     }
 
-    pub fn serve(&self, stream: TcpStream, audio_to: Option<SocketAddr>) {
+    pub fn serve(&self, stream: BlockingSend, audio_to: Option<Link>) {
         match self {
             Hub::Tiles(h) => {
                 let _ = audio_to;
@@ -283,24 +283,23 @@ impl VideoSink {
 
 pub struct Viewer {
     pub sink: Arc<VideoSink>,
-    stream: TcpStream,
+    conn: quinn::Connection,
+    /// Held open for the life of the view (closing it ends the stream).
+    _send: quinn::SendStream,
 }
 
 impl Viewer {
-    /// Connects to a sharer's screen stream. `clock_offset_us` is the
-    /// sharer's clock minus ours, kept current by the ping loop.
-    pub fn connect(
-        addr: std::net::SocketAddr,
-        hello: protocol::Hello,
+    /// Reads a sharer's screen stream on a connection `net::quic::open_screen`
+    /// set up. `clock_offset_us` is the sharer's clock minus ours, kept
+    /// current by the ping loop.
+    pub fn start(
+        conn: quinn::Connection,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
         clock_offset_us: Arc<AtomicI64>,
     ) -> Result<Self, String> {
-        let mut stream =
-            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-        let _ = stream.set_nodelay(true);
-        let _ = socket2::SockRef::from(&stream).set_recv_buffer_size(8 << 20);
-        protocol::write_frame(&mut stream, &protocol::encode(&hello)).map_err(|e| e.to_string())?;
         let sink = VideoSink::new();
-        let reader = stream.try_clone().map_err(|e| e.to_string())?;
+        let reader = BlockingRecv::new(recv);
         let s = sink.clone();
         thread::Builder::new()
             .name("screen-recv".into())
@@ -309,13 +308,13 @@ impl Viewer {
                 receive(reader, s, clock_offset_us)
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { sink, stream })
+        Ok(Self { sink, conn, _send: send })
     }
 }
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
+        self.conn.close(0u32.into(), b"stopped watching");
     }
 }
 
@@ -334,7 +333,7 @@ impl Meter {
     }
 }
 
-fn receive(mut stream: TcpStream, sink: Arc<VideoSink>, offset: Arc<AtomicI64>) {
+fn receive(mut stream: BlockingRecv, sink: Arc<VideoSink>, offset: Arc<AtomicI64>) {
     let mut buf = Vec::new();
     let mut m = Meter { window_start: Instant::now(), frames: 0, bytes: 0, latency: 0.0, encode: 0.0, decode: 0.0 };
     let mut codec_name = "tiles";
