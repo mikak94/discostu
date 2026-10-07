@@ -1522,6 +1522,11 @@ impl App {
                 PortMap::Disabled => "Router port mapping: off".to_string(),
             };
             col = col.push(text(upnp).size(12).color(FAINT));
+            let v6 = match i.ipv6.first() {
+                Some(a) => format!("IPv6: {a}. Friends with IPv6 reach you directly, no router setup involved."),
+                None => "IPv6: none from your provider (IPv4 only).".to_string(),
+            };
+            col = col.push(text(v6).size(12).color(FAINT));
         }
         let broker_failed_key = matches!(&i.status, BrokerStatus::Failed(e) if e.contains("identity changed"));
         let mut broker_row = row![
