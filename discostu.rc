@@ -1,0 +1,2 @@
+// Embedded into the .exe: Explorer, pinned taskbar shortcuts and Alt+Tab use it.
+1 ICON "assets/discostu.ico"

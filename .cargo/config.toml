@@ -1,0 +1,3 @@
+[env]
+# bindgen (asio-sys) needs libclang
+LIBCLANG_PATH = "C:/Program Files/LLVM/bin"
