@@ -142,6 +142,8 @@ pub struct Mixer {
     speech_level: f32,
     gate: f32,
     gate_hold: u32,
+    /// Manual mic gain as applied (ramps toward the setting).
+    mic_gain: f32,
     /// Last tick: someone in our room is talking and we aren't. Their voice
     /// in our mic must not go out, or train our voice profile.
     roommate_talking: bool,
@@ -190,6 +192,7 @@ impl Mixer {
             speech_level: -40.0,
             gate: 0.0,
             gate_hold: 0,
+            mic_gain: 1.0,
             roommate_talking: false,
             roommate_hold: 0,
             learn_ok: true,
@@ -298,6 +301,18 @@ impl Mixer {
         let sh = self.shared.clone();
         let flag = |a: &AtomicBool| a.load(Ordering::Relaxed);
         let mic_in = *mic;
+
+        // 0. Manual mic gain (Settings), ramped so moving the slider never
+        //    clicks. The recording above keeps the raw device level.
+        let gain_target = sh.mic_gain.load();
+        if gain_target != 1.0 || self.mic_gain != 1.0 {
+            let start = self.mic_gain;
+            self.mic_gain += 0.3 * (gain_target - self.mic_gain);
+            if (self.mic_gain - gain_target).abs() < 1e-4 {
+                self.mic_gain = gain_target;
+            }
+            ramp(mic, start, self.mic_gain);
+        }
         self.rec_peers.clear();
         self.rec_peer_ticks = [PeerTick::default(); recorder::MAX_PEERS];
 

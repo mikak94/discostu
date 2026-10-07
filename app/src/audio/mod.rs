@@ -152,6 +152,8 @@ pub struct AudioShared {
     pub crosstalk_cancel: AtomicBool,
     pub noise_gate: AtomicBool,
     pub stream_volume: AtomicF32,
+    /// Manual microphone gain (linear), set by the user for quiet mics.
+    pub mic_gain: AtomicF32,
     pub local_level: AtomicF32,
     pub local_voice: AtomicBool,
     pub profile_progress: AtomicF32,
@@ -175,6 +177,7 @@ pub struct AudioSettings {
     pub crosstalk_cancel: bool,
     pub noise_gate: bool,
     pub stream_volume: f32,
+    pub mic_gain_db: f32,
     pub profile_path: PathBuf,
 }
 
@@ -191,6 +194,7 @@ impl AudioShared {
             crosstalk_cancel: AtomicBool::new(settings.crosstalk_cancel),
             noise_gate: AtomicBool::new(settings.noise_gate),
             stream_volume: AtomicF32::new(settings.stream_volume),
+            mic_gain: AtomicF32::new(db_to_gain(settings.mic_gain_db)),
             local_level: AtomicF32::new(0.0),
             local_voice: AtomicBool::new(false),
             profile_progress: AtomicF32::new(0.0),
@@ -314,4 +318,8 @@ impl AudioShared {
     pub fn playback_underruns(&self) -> u64 {
         self.counters.output_underruns.load(Ordering::Relaxed)
     }
+}
+
+pub fn db_to_gain(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
 }
