@@ -200,6 +200,8 @@ pub struct Snapshot {
     pub noise_gate: bool,
     pub share_audio: bool,
     pub stream_volume: f32,
+    /// Top of the per-person volume sliders.
+    pub max_volume: f32,
     pub dsp_load: f32,
 }
 
@@ -680,7 +682,9 @@ impl Engine {
     }
 
     pub fn stop_share(&self) {
-        if let Some(hub) = self.share.lock().take() {
+        // Release the lock before announcing: the status reads `share` too.
+        let hub = self.share.lock().take();
+        if let Some(hub) = hub {
             hub.stop();
             self.broadcast_status();
         }
@@ -733,6 +737,24 @@ impl Engine {
         let mut cfg = self.cfg.lock();
         cfg.share_audio = on;
         cfg.save();
+    }
+
+    /// How far the per-person sliders go. Lowering it turns down anyone
+    /// above the new limit.
+    pub fn set_max_volume(&self, max: f32) {
+        let max = max.clamp(1.0, 8.0);
+        let mut cfg = self.cfg.lock();
+        cfg.max_volume = max;
+        for v in cfg.peer_volumes.values_mut() {
+            *v = v.min(max);
+        }
+        cfg.save();
+        drop(cfg);
+        for p in self.peers.read().values() {
+            if p.audio.volume.load() > max {
+                p.audio.volume.store(max);
+            }
+        }
     }
 
     pub fn set_stream_volume(&self, v: f32) {
@@ -902,6 +924,7 @@ impl Engine {
             noise_gate: cfg.noise_gate,
             share_audio: cfg.share_audio,
             stream_volume: cfg.stream_volume,
+            max_volume: cfg.max_volume,
             dsp_load: a.dsp_load.load(),
         }
     }
