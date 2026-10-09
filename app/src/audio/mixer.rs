@@ -11,13 +11,13 @@ use rtrb::{Consumer, Producer};
 
 use super::device::DeviceIo;
 use super::dsp::echo::{EchoCanceller, ramp};
-use super::dsp::profile::{Analyzer, NoiseFloor, Vad, VoiceProfile};
+use super::dsp::profile::{self as voice, Analyzer, Bands, NoiseFloor, Vad, VoiceProfile};
 use super::dsp::talker::{Talker, TalkerDetector};
 use super::recorder::{self, PeerTick, Recorder};
 use super::dsp::{History, coeff, db, energy};
 use super::resample::Resampler;
 use super::jitter::{JitterBuffer, JitterStats};
-use super::{AudioShared, STEREO_BLOCK};
+use super::{AudioShared, ProfileEdit, STEREO_BLOCK};
 use crate::clock;
 use crate::protocol::{self, BLOCK, PeerId, SAMPLE_RATE};
 
@@ -139,6 +139,9 @@ pub struct Mixer {
     profile_dirty: bool,
     last_save: Instant,
     similarity: f32,
+    /// The mic's band shape, smoothed for the profile editor.
+    live_shape: Bands,
+    view_ticks: u32,
     speech_level: f32,
     gate: f32,
     gate_hold: u32,
@@ -189,6 +192,8 @@ impl Mixer {
             profile_dirty: false,
             last_save: Instant::now(),
             similarity: 0.0,
+            live_shape: [0.0; voice::BANDS],
+            view_ticks: 0,
             speech_level: -40.0,
             gate: 0.0,
             gate_hold: 0,
@@ -286,6 +291,29 @@ impl Mixer {
         }
     }
 
+    /// Hands the profile editor a fresh picture every 20 ms.
+    fn publish_profile(&mut self, bands: &Bands, speaking: bool) {
+        let s = voice::shape(bands, &self.profile.ignored);
+        for (l, v) in self.live_shape.iter_mut().zip(s) {
+            *l += 0.35 * (v - *l);
+        }
+        self.view_ticks += 1;
+        if self.view_ticks < 8 {
+            return;
+        }
+        self.view_ticks = 0;
+        if let Some(mut v) = self.shared.profile_view.try_lock() {
+            v.mean = self.profile.mean;
+            v.spread = self.profile.var.map(f32::sqrt);
+            v.ignored = self.profile.ignored;
+            v.live = self.live_shape;
+            v.similarity = self.similarity;
+            v.speaking = speaking;
+            v.usable = self.profile.usable();
+            v.seconds = self.profile.seconds();
+        }
+    }
+
     fn save_profile(&mut self) {
         if let Ok(json) = serde_json::to_vec(&self.profile) {
             if let Some(dir) = self.shared.profile_path.parent() {
@@ -320,6 +348,16 @@ impl Mixer {
             self.profile = VoiceProfile::default();
             self.save_profile();
         }
+        let edits = sh.take_profile_edits();
+        if !edits.is_empty() {
+            for e in edits {
+                match e {
+                    ProfileEdit::SetBand(b, db) => self.profile.set_band(b, db),
+                    ProfileEdit::ToggleIgnored(b) => self.profile.toggle_ignored(b),
+                }
+            }
+            self.profile_dirty = true;
+        }
 
         // 1. Acoustic echo cancellation against what we played last tick.
         if flag(&sh.echo_cancel) {
@@ -348,11 +386,19 @@ impl Mixer {
         let live = !flag(&sh.muted) && !flag(&sh.deafened);
         // Only learn speech that is ours alone: a roommate talking more than us
         // would otherwise slowly turn our profile into theirs.
-        if live && speaking && snr > 14.0 && level_db > self.speech_level - 10.0 && !echo_dominant && self.learn_ok {
+        if live
+            && flag(&sh.profile_learning)
+            && speaking
+            && snr > 14.0
+            && level_db > self.speech_level - 10.0
+            && !echo_dominant
+            && self.learn_ok
+        {
             self.profile.learn(&bands);
             self.profile_dirty = true;
         }
         sh.profile_progress.store(self.profile.progress());
+        self.publish_profile(&bands, speaking);
         let me_talking = speaking && (!self.profile.usable() || self.similarity > 0.3);
 
         // Soft limiter instead of hard clipping at the 16-bit conversion.
@@ -367,7 +413,8 @@ impl Mixer {
         //    separation): their voice reached our mic through the air, and they
         //    must not hear it come back.
         let roommate = flag(&sh.crosstalk_cancel) && self.roommate_talking;
-        let voiced = speaking && !roommate && (!self.profile.usable() || self.similarity > 0.05);
+        let voiced =
+            speaking && !roommate && (!self.profile.usable() || self.similarity > sh.gate_threshold.load());
         if voiced {
             self.gate_hold = GATE_HOLD;
         } else if roommate {

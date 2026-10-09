@@ -46,6 +46,10 @@ pub struct Config {
     /// Channels from before they lived on the broker; handed over on the
     /// first broker connection, then empty.
     pub channels: Vec<Channel>,
+    /// Keep training the voice profile from our speech.
+    pub profile_learning: bool,
+    /// How closely speech must match the voice profile to open the gate (-1..1).
+    pub gate_threshold: f32,
     /// Manual boost for a quiet microphone, in dB (0 = as the device delivers).
     pub mic_gain_db: f32,
     /// Top of the per-person volume sliders (2.0 = 200%).
@@ -74,6 +78,8 @@ impl Default for Config {
             manual_peers: Vec::new(),
             channels: Vec::new(),
             mic_gain_db: 0.0,
+            profile_learning: true,
+            gate_threshold: 0.05,
             max_volume: 2.0,
             peer_volumes: HashMap::new(),
         }
