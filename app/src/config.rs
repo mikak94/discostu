@@ -55,6 +55,9 @@ pub struct Config {
     /// Top of the per-person volume sliders (2.0 = 200%).
     pub max_volume: f32,
     pub peer_volumes: HashMap<PeerId, f32>,
+    /// Names of group members we've seen, for labelling their channels
+    /// while they're offline.
+    pub known_names: HashMap<PeerId, String>,
 }
 
 impl Default for Config {
@@ -82,6 +85,7 @@ impl Default for Config {
             gate_threshold: 0.05,
             max_volume: 2.0,
             peer_volumes: HashMap::new(),
+            known_names: HashMap::new(),
         }
     }
 }

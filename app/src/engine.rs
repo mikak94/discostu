@@ -443,9 +443,26 @@ impl Engine {
         self.pending_channels.lock().retain(|(c, at)| {
             at.elapsed() < PENDING_CHANNEL && !channels.iter().any(|e| e.owner == self.me && e.channel.id == c.id)
         });
+        self.remember_names(members.iter().map(|m| (m.id, m.name.as_str())));
         *self.members.lock() = members;
         *self.channels.lock() = channels;
         self.reroute();
+    }
+
+    /// Keeps who-is-who across sessions, so a channel made by someone who's
+    /// offline still says who made it.
+    fn remember_names<'a>(&self, seen: impl Iterator<Item = (PeerId, &'a str)>) {
+        let mut cfg = self.cfg.lock();
+        let mut changed = false;
+        for (id, name) in seen {
+            if id != self.me && cfg.known_names.get(&id).map(String::as_str) != Some(name) {
+                cfg.known_names.insert(id, name.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            cfg.save();
+        }
     }
 
     pub fn on_broker_lost(&self) {
@@ -609,7 +626,7 @@ impl Engine {
         self.notice.lock().take()
     }
 
-    /// Open = the broker lists it (its owner is online), or we just made it.
+    /// Open = the broker lists it, or we just made it.
     fn channel_open(&self, r: ChannelRef) -> bool {
         if r.owner == self.me && self.pending_channels.lock().iter().any(|(c, _)| c.id == r.id) {
             return true;
@@ -627,7 +644,7 @@ impl Engine {
         {
             here = None;
             *self.channel.lock() = None;
-            *self.notice.lock() = Some("The channel closed: its owner left. You're back in the lobby.".into());
+            *self.notice.lock() = Some("The channel was deleted by the person who made it. You're back in the lobby.".into());
         }
         for p in self.peers.read().values() {
             p.audio.set_in_channel(p.status.lock().channel == here);
@@ -644,7 +661,10 @@ impl Engine {
         if let Some(p) = self.peers.read().get(&id) {
             return p.status.lock().name.clone();
         }
-        self.members.lock().iter().find(|m| m.id == id).map_or_else(|| "someone".into(), |m| m.name.clone())
+        if let Some(m) = self.members.lock().iter().find(|m| m.id == id) {
+            return m.name.clone();
+        }
+        self.cfg.lock().known_names.get(&id).cloned().unwrap_or_else(|| "someone".into())
     }
 
     fn channel_views(&self) -> Vec<ChannelView> {

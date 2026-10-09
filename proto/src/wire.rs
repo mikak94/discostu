@@ -61,8 +61,8 @@ pub struct ShareInfo {
 
 pub type ChannelId = u64;
 
-/// A voice channel. The broker keeps them per group and lists one while its
-/// creator is online. Membership is each peer's [`PeerStatus::channel`];
+/// A voice channel. The broker keeps them per group until their creator
+/// deletes them, whether or not the creator is online. Membership is each peer's [`PeerStatus::channel`];
 /// audio stays peer-to-peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
