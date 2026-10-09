@@ -16,7 +16,9 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
 use crate::audio::jitter::JitterStats;
-use crate::audio::{AudioSettings, AudioShared, DeviceSpec, DeviceStatus, Driver, NetStats, PeerAudio};
+use crate::audio::{
+    AudioSettings, AudioShared, DeviceSpec, DeviceStatus, Driver, NetStats, PeerAudio, ProfileEdit, ProfileView,
+};
 use crate::config::Config;
 use crate::net::{self, Link, portmap::PortMap, quic};
 use crate::protocol::{Channel, ChannelId, ChannelRef, Ctrl, PeerId, PeerStatus, ShareInfo};
@@ -210,6 +212,9 @@ pub struct Snapshot {
     /// Top of the per-person volume sliders.
     pub max_volume: f32,
     pub mic_gain_db: f32,
+    pub profile: ProfileView,
+    pub profile_learning: bool,
+    pub gate_threshold: f32,
     pub dsp_load: f32,
 }
 
@@ -245,6 +250,8 @@ impl Engine {
                 spec: device_spec(&cfg),
                 stream_volume: cfg.stream_volume,
                 mic_gain_db: cfg.mic_gain_db,
+                profile_learning: cfg.profile_learning,
+                gate_threshold: cfg.gate_threshold,
                 echo_cancel: cfg.echo_cancel,
                 crosstalk_cancel: cfg.crosstalk_cancel,
                 noise_gate: cfg.noise_gate,
@@ -805,6 +812,27 @@ impl Engine {
         cfg.save();
     }
 
+    /// Hand edit from the profile editor (applied on the next DSP tick, saved
+    /// with the profile).
+    pub fn edit_profile(&self, edit: ProfileEdit) {
+        self.audio.edit_profile(edit);
+    }
+
+    pub fn set_profile_learning(&self, on: bool) {
+        self.audio.profile_learning.store(on, Ordering::Relaxed);
+        let mut cfg = self.cfg.lock();
+        cfg.profile_learning = on;
+        cfg.save();
+    }
+
+    pub fn set_gate_threshold(&self, t: f32) {
+        let t = t.clamp(-1.0, 1.0);
+        self.audio.gate_threshold.store(t);
+        let mut cfg = self.cfg.lock();
+        cfg.gate_threshold = t;
+        cfg.save();
+    }
+
     pub fn reset_voice_profile(&self) {
         self.audio.reset_voice_profile();
     }
@@ -961,6 +989,9 @@ impl Engine {
             stream_volume: cfg.stream_volume,
             max_volume: cfg.max_volume,
             mic_gain_db: cfg.mic_gain_db,
+            profile: a.profile_view.lock().clone(),
+            profile_learning: cfg.profile_learning,
+            gate_threshold: cfg.gate_threshold,
             dsp_load: a.dsp_load.load(),
         }
     }

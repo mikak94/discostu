@@ -6,8 +6,10 @@
 //! confident speech. It sharpens over minutes of talking and is persisted, so
 //! it keeps improving across sessions. It is used to:
 //! - gate the mic on "sounds like me" rather than raw loudness, and
-//! - decide whether residual audio in a peer's stream is *our* voice leaking
-//!   back (suppress) or theirs (keep).
+//! - tell our voice from a roommate's in our mic (same-room separation).
+//!
+//! It never changes the sound: it's a yes/no input to those decisions. Users
+//! can see it, reshape it by hand and exclude bands (Settings).
 
 use std::sync::Arc;
 
@@ -187,21 +189,33 @@ pub struct VoiceProfile {
     /// Per-band variance of the shape (dB²).
     pub var: Bands,
     pub frames: u64,
+    /// Bands the user excluded (a fan's hum, a whine): they count neither
+    /// in the shape nor in the comparison.
+    #[serde(default)]
+    pub ignored: [bool; BANDS],
 }
 
 impl Default for VoiceProfile {
     fn default() -> Self {
-        Self { mean: [0.0; BANDS], var: [36.0; BANDS], frames: 0 }
+        Self { mean: [0.0; BANDS], var: [36.0; BANDS], frames: 0, ignored: [false; BANDS] }
     }
 }
 
-fn shape(bands: &Bands) -> Bands {
-    let mean = bands.iter().sum::<f32>() / BANDS as f32;
-    let mut out = *bands;
-    for v in out.iter_mut() {
-        *v -= mean;
-    }
-    out
+/// How far the user can drag a band, in dB from the voice's average.
+pub const EDIT_RANGE_DB: f32 = 30.0;
+
+/// Centre frequency of each band (Hz), for labelling.
+pub fn band_centers() -> Bands {
+    let (lo, hi) = (mel(F_LO), mel(F_HI));
+    std::array::from_fn(|b| inv_mel(lo + (hi - lo) * (b + 1) as f32 / (BANDS + 1) as f32))
+}
+
+/// Level-normalised shape: each band relative to the average of the bands
+/// that count (ignored ones come out as 0).
+pub fn shape(bands: &Bands, ignored: &[bool; BANDS]) -> Bands {
+    let used = ignored.iter().filter(|i| !**i).count().max(1);
+    let mean = bands.iter().zip(ignored).filter(|(_, i)| !**i).map(|(b, _)| b).sum::<f32>() / used as f32;
+    std::array::from_fn(|i| if ignored[i] { 0.0 } else { bands[i] - mean })
 }
 
 impl VoiceProfile {
@@ -219,7 +233,7 @@ impl VoiceProfile {
     }
 
     pub fn learn(&mut self, bands: &Bands) {
-        let s = shape(bands);
+        let s = shape(bands, &self.ignored);
         self.frames += 1;
         // Running mean at first, then a slow EMA (~10 min of speech) so the
         // profile follows mic/room changes without forgetting the voice.
@@ -232,11 +246,24 @@ impl VoiceProfile {
         }
     }
 
+    /// Sets one band of the learned shape by hand.
+    pub fn set_band(&mut self, band: usize, db: f32) {
+        if band < BANDS {
+            self.mean[band] = db.clamp(-EDIT_RANGE_DB, EDIT_RANGE_DB);
+        }
+    }
+
+    pub fn toggle_ignored(&mut self, band: usize) {
+        if band < BANDS {
+            self.ignored[band] = !self.ignored[band];
+        }
+    }
+
     /// Variance-weighted cosine similarity of spectral shape, in -1..1.
     pub fn similarity(&self, bands: &Bands) -> f32 {
-        let s = shape(bands);
+        let s = shape(bands, &self.ignored);
         let (mut num, mut na, mut nb) = (0.0, 0.0, 0.0);
-        for i in 0..BANDS {
+        for i in (0..BANDS).filter(|i| !self.ignored[*i]) {
             let w = 1.0 / self.var[i].sqrt();
             let (a, b) = (s[i] * w, self.mean[i] * w);
             num += a * b;
@@ -292,5 +319,32 @@ mod tests {
         let loud = [-30.0; BANDS];
         let snr = nf.update(&loud);
         assert!(vad.update(snr, -30.0, 10));
+    }
+
+    #[test]
+    fn ignored_bands_do_not_count() {
+        let mut p = VoiceProfile::default();
+        let voice: Bands = std::array::from_fn(|i| -40.0 - i as f32);
+        for _ in 0..4000 {
+            p.learn(&voice);
+        }
+        let near = p.similarity(&voice);
+        // A loud hum in band 2 wrecks the match until that band is ignored.
+        let mut hum = voice;
+        hum[2] += 40.0;
+        let with_hum = p.similarity(&hum);
+        p.toggle_ignored(2);
+        let ignored = p.similarity(&hum);
+        assert!(near > 0.99, "{near}");
+        assert!(with_hum < 0.8, "{with_hum}");
+        assert!(ignored > 0.99, "{ignored}");
+    }
+
+    #[test]
+    fn edits_are_clamped() {
+        let mut p = VoiceProfile::default();
+        p.set_band(3, 99.0);
+        p.set_band(99, 1.0);
+        assert_eq!(p.mean[3], EDIT_RANGE_DB);
     }
 }

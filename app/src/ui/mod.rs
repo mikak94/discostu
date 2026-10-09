@@ -1,6 +1,7 @@
 //! The iced front end.
 
 mod icons;
+mod profile_chart;
 mod taskbar;
 mod theme;
 mod video;
@@ -11,12 +12,12 @@ use std::time::{Duration, Instant};
 
 use iced::font::Weight;
 use iced::widget::{
-    Space, button, center, column, container, image, mouse_area, opaque, pick_list, row, scrollable, shader,
+    canvas, Space, button, center, column, container, image, mouse_area, opaque, pick_list, row, scrollable, shader,
     slider, stack, svg, text, text_input, toggler, tooltip,
 };
 use iced::{Alignment, Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
-use crate::audio::{DeviceSpec, Driver, device};
+use crate::audio::{DeviceSpec, Driver, ProfileEdit, device};
 use crate::engine::{BrokerStatus, Engine, PeerView, Snapshot, Toggle};
 use crate::net::portmap::PortMap;
 use crate::protocol::{BLOCK, ChannelId, ChannelRef, PeerId, SAMPLE_RATE};
@@ -165,6 +166,10 @@ enum Message {
     Exclusive(bool),
     Toggle(Toggle, bool),
     ResetProfile,
+    ProfileBand(usize, f32),
+    ProfileIgnore(usize),
+    ProfileLearning(bool),
+    GateThreshold(f32),
     SaveDiagnostics,
     ToggleFullscreen,
     PointerMoved,
@@ -523,6 +528,16 @@ impl App {
             Message::SaveDiagnostics => {
                 engine.save_diagnostics();
                 self.toast("Saving the last 10 seconds of audio…");
+            }
+            Message::ProfileBand(band, db) => engine.edit_profile(ProfileEdit::SetBand(band, db)),
+            Message::ProfileIgnore(band) => engine.edit_profile(ProfileEdit::ToggleIgnored(band)),
+            Message::ProfileLearning(on) => {
+                engine.set_profile_learning(on);
+                self.refresh();
+            }
+            Message::GateThreshold(t) => {
+                engine.set_gate_threshold(t);
+                self.refresh();
             }
             Message::ResetProfile => {
                 engine.reset_voice_profile();
@@ -1369,29 +1384,7 @@ impl App {
                 s.noise_gate,
                 Toggle::NoiseGate,
             ),
-            container(
-                column![
-                    row![
-                        text("Voice profile").size(14).font(SEMIBOLD).width(Length::Fill),
-                        button(text("Reset").size(12)).padding([4, 10]).style(theme::ghost).on_press(Message::ResetProfile),
-                    ]
-                    .align_y(Alignment::Center),
-                    meter(progress, ACCENT),
-                    text(if progress >= 1.0 {
-                        "Trained. Keeps adapting slowly as your voice, mic and room change.".to_string()
-                    } else {
-                        format!(
-                            "{:.0}% — learns the shape of your voice whenever you talk, and remembers it.",
-                            progress * 100.0
-                        )
-                    })
-                    .size(12)
-                    .color(MUTED),
-                ]
-                .spacing(8),
-            )
-            .padding(14)
-            .style(theme::card),
+            self.profile_card(progress),
         ]
         .spacing(12);
 
@@ -1452,6 +1445,65 @@ impl App {
     }
 
     /// Where the milliseconds go, mouth to ear, with the current devices.
+    /// The voice profile: what it learned, the mic live against it, and the
+    /// controls to reshape it, freeze it, or set how strict the gate is.
+    fn profile_card(&self, progress: f32) -> El<'_> {
+        let s = &self.snap;
+        let p = &s.profile;
+        let status = if progress >= 1.0 {
+            if s.profile_learning {
+                "Trained. Keeps adapting slowly as your voice, mic and room change.".to_string()
+            } else {
+                "Frozen: it stays exactly as it is until you turn learning back on.".to_string()
+            }
+        } else {
+            format!("{:.0}% trained. It learns the shape of your voice whenever you talk.", progress * 100.0)
+        };
+        let opens = p.similarity > s.gate_threshold;
+        let verdict = if !p.usable {
+            "the gate doesn't use the profile until it's trained a little".to_string()
+        } else if !p.speaking {
+            "waiting for speech".to_string()
+        } else if opens {
+            "sounds like you, gate opens".to_string()
+        } else {
+            "doesn't sound like you, gate stays shut".to_string()
+        };
+        let verdict_color = if p.usable && p.speaking { if opens { GREEN } else { AMBER } } else { FAINT };
+        container(
+            column![
+                row![
+                    text("Voice profile").size(14).font(SEMIBOLD).width(Length::Fill),
+                    text("Learning").size(12).color(MUTED),
+                    toggler(s.profile_learning).on_toggle(Message::ProfileLearning).size(18).style(theme::switch),
+                    button(text("Reset").size(12)).padding([4, 10]).style(theme::ghost).on_press(Message::ResetProfile),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                canvas(profile_chart::ProfileChart { view: p }).width(Length::Fill).height(170),
+                text(
+                    "Line: your voice (shaded: its usual range). Bars: your mic right now, green while you talk. \
+                     Drag to reshape a band; right-click a band to ignore it (fan hum, a whine).",
+                )
+                .size(11)
+                .color(FAINT),
+                row![
+                    text("Strictness").size(13).color(MUTED).width(80),
+                    slider(-0.2..=0.8, s.gate_threshold, Message::GateThreshold).step(0.01f32).style(theme::volume),
+                    text(format!("{:.2}", s.gate_threshold)).size(12).color(MUTED).width(36),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                text(format!("Match now {:+.2} · {verdict}", p.similarity)).size(12).color(verdict_color),
+                text(status).size(12).color(MUTED),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .style(theme::card)
+        .into()
+    }
+
     /// Friends group and broker: how people outside this LAN find us.
     fn internet_settings(&self) -> El<'_> {
         let i = &self.snap.internet;

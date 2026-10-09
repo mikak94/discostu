@@ -5,7 +5,7 @@ edition.workspace = true
 description = "Peer-to-peer voice + screen sharing with sub-millisecond transport latency"
 
 [dependencies]
-iced = { version = "0.14", features = ["image", "svg", "wgpu", "advanced", "tokio"] }
+iced = { version = "0.14", features = ["image", "svg", "canvas", "wgpu", "advanced", "tokio"] }
 cpal = { version = "0.18", features = ["asio"] }
 xcap = "0.9"
 lz4_flex = "0.14"

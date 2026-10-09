@@ -154,6 +154,14 @@ pub struct AudioShared {
     pub stream_volume: AtomicF32,
     /// Manual microphone gain (linear), set by the user for quiet mics.
     pub mic_gain: AtomicF32,
+    /// The voice profile as the UI shows it, refreshed by the DSP ~50 times/s.
+    pub profile_view: Mutex<ProfileView>,
+    /// Edits from the UI, applied on the next DSP tick.
+    profile_edits: Mutex<Vec<ProfileEdit>>,
+    /// Keep training the profile from our speech (off: frozen as it is).
+    pub profile_learning: AtomicBool,
+    /// How closely speech must match the profile to open the gate (-1..1).
+    pub gate_threshold: AtomicF32,
     pub local_level: AtomicF32,
     pub local_voice: AtomicBool,
     pub profile_progress: AtomicF32,
@@ -178,6 +186,8 @@ pub struct AudioSettings {
     pub noise_gate: bool,
     pub stream_volume: f32,
     pub mic_gain_db: f32,
+    pub profile_learning: bool,
+    pub gate_threshold: f32,
     pub profile_path: PathBuf,
 }
 
@@ -195,6 +205,10 @@ impl AudioShared {
             noise_gate: AtomicBool::new(settings.noise_gate),
             stream_volume: AtomicF32::new(settings.stream_volume),
             mic_gain: AtomicF32::new(db_to_gain(settings.mic_gain_db)),
+            profile_view: Mutex::new(ProfileView::default()),
+            profile_edits: Mutex::new(Vec::new()),
+            profile_learning: AtomicBool::new(settings.profile_learning),
+            gate_threshold: AtomicF32::new(settings.gate_threshold),
             local_level: AtomicF32::new(0.0),
             local_voice: AtomicBool::new(false),
             profile_progress: AtomicF32::new(0.0),
@@ -307,6 +321,15 @@ impl AudioShared {
         self.snapshot_result.lock().take()
     }
 
+    pub fn edit_profile(&self, edit: ProfileEdit) {
+        self.profile_edits.lock().push(edit);
+    }
+
+    /// Pending UI edits (the DSP thread takes them without waiting).
+    fn take_profile_edits(&self) -> Vec<ProfileEdit> {
+        self.profile_edits.try_lock().map(|mut e| std::mem::take(&mut *e)).unwrap_or_default()
+    }
+
     pub fn reset_voice_profile(&self) {
         self.reset_profile.store(true, Ordering::Relaxed);
     }
@@ -322,4 +345,27 @@ impl AudioShared {
 
 pub fn db_to_gain(db: f32) -> f32 {
     10f32.powf(db / 20.0)
+}
+
+/// What the profile editor draws.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileView {
+    /// Learned shape and its spread (dB relative to the voice's average).
+    pub mean: dsp::profile::Bands,
+    pub spread: dsp::profile::Bands,
+    pub ignored: [bool; dsp::profile::BANDS],
+    /// The mic right now, normalised the same way (what gets compared).
+    pub live: dsp::profile::Bands,
+    /// Live match against the profile, -1..1.
+    pub similarity: f32,
+    pub speaking: bool,
+    /// Trained enough for the gate to use it.
+    pub usable: bool,
+    pub seconds: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ProfileEdit {
+    SetBand(usize, f32),
+    ToggleIgnored(usize),
 }
