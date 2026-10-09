@@ -4,7 +4,10 @@
 //! grows on underruns or measured jitter, and shrinks back after a quiet
 //! period. Every discontinuity it introduces is smoothed:
 //! - drift correction drops a block by crossfading it into the next one,
-//! - concealment fades out, and real audio fades back in afterwards.
+//! - a missing block is replaced by repeating the voice's last pitch cycle
+//!   (found by autocorrelation), joined without a step, held for 5 ms and
+//!   then faded out; real audio fades back in, again joined without a step.
+//!   Repeating whole 2.5 ms blocks instead clicks at every seam.
 
 use std::collections::VecDeque;
 
@@ -14,6 +17,17 @@ const BLOCK_US: f32 = BLOCK as f32 * 1e6 / SAMPLE_RATE as f32;
 const MAX_DEPTH: usize = 40; // 100 ms
 /// Cap on one packet's timing deviation (20 ms).
 const MAX_DEVIATION_US: f32 = 20_000.0;
+/// Output kept for concealment (frames): 40 ms.
+const HIST_FRAMES: usize = 1920;
+/// Pitch search range (frames): 500 Hz down to 66 Hz.
+const MIN_PERIOD: usize = 96;
+const MAX_PERIOD: usize = 720;
+/// Stretch of audio compared when looking for the pitch (frames, 5 ms).
+const MATCH: usize = 240;
+/// Length of the bend that joins two pieces of audio (frames, 1 ms).
+const SEAM: usize = 48;
+/// Concealed blocks played at full level before fading (5 ms).
+const HOLD_BLOCKS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitterStats {
@@ -33,9 +47,16 @@ pub struct JitterBuffer<const N: usize> {
     target: usize,
     /// Never aim below this many blocks (bursty senders).
     min_target: usize,
-    last: [f32; N],
+    /// The last [`HIST_FRAMES`] of output, interleaved.
+    hist: Vec<f32>,
+    /// One pitch cycle, looped while concealing, and where in it we are.
+    pattern: Vec<f32>,
+    phase: usize,
+    /// Scratch for the pitch search (mono history).
+    mono: Vec<f32>,
     conceal_gain: f32,
     concealing: bool,
+    conceal_blocks: u32,
     last_arrival: Option<(u32, u64)>,
     jitter_us: f32,
     stable_blocks: u32,
@@ -53,9 +74,13 @@ impl<const N: usize> JitterBuffer<N> {
             playing: false,
             target: 1,
             min_target: 1,
-            last: [0.0; N],
+            hist: vec![0.0; HIST_FRAMES * channels],
+            pattern: Vec::with_capacity(MAX_PERIOD * channels),
+            phase: 0,
+            mono: Vec::with_capacity(HIST_FRAMES),
             conceal_gain: 0.0,
             concealing: false,
+            conceal_blocks: 0,
             last_arrival: None,
             jitter_us: 0.0,
             stable_blocks: 0,
@@ -158,9 +183,10 @@ impl<const N: usize> JitterBuffer<N> {
                 }
                 if self.concealing {
                     ramp(&mut block, self.conceal_gain, 1.0, self.channels);
+                    self.join(&mut block);
                     self.concealing = false;
                 }
-                self.last = block;
+                self.remember(&block);
                 self.conceal_gain = 1.0;
                 self.adapt();
                 block
@@ -216,20 +242,112 @@ impl<const N: usize> JitterBuffer<N> {
         false
     }
 
+    /// Stands in for a block that isn't there: the voice's last pitch cycle,
+    /// looped, held briefly, then faded so long gaps decay to silence.
     fn conceal(&mut self) -> [f32; N] {
-        // Repeat the last block with a fast fade so short gaps are smoothed
-        // and long ones decay to silence.
-        let mut out = self.last;
-        let start = self.conceal_gain;
-        self.conceal_gain *= 0.5;
-        if self.conceal_gain < 0.01 {
-            self.conceal_gain = 0.0;
+        let ch = self.channels;
+        if !self.concealing {
+            self.start_pattern();
+            self.conceal_blocks = 0;
         }
-        ramp(&mut out, start, self.conceal_gain, self.channels);
-        self.last = out;
+        let period = self.pattern.len() / ch;
+        let mut out = [0.0; N];
+        for f in 0..N / ch {
+            let src = (self.phase + f) % period;
+            out[f * ch..(f + 1) * ch].copy_from_slice(&self.pattern[src * ch..(src + 1) * ch]);
+        }
+        self.phase = (self.phase + N / ch) % period;
+
+        let start = self.conceal_gain;
+        if self.conceal_blocks >= HOLD_BLOCKS {
+            self.conceal_gain *= 0.7;
+            if self.conceal_gain < 0.02 {
+                self.conceal_gain = 0.0;
+            }
+        }
+        ramp(&mut out, start, self.conceal_gain, ch);
+        self.conceal_blocks += 1;
         self.concealing = true;
+        self.remember(&out);
         out
     }
+
+    /// Takes the last pitch cycle of the output as the loop, bent at its
+    /// start so the loop continues the audio, and its own wrap, smoothly.
+    fn start_pattern(&mut self) {
+        let ch = self.channels;
+        let period = self.pitch_period();
+        let end = HIST_FRAMES * ch;
+        self.pattern.clear();
+        self.pattern.extend_from_slice(&self.hist[end - period * ch..end]);
+        for c in 0..ch {
+            let delta = self.predicted(c) - self.pattern[c];
+            for f in 0..SEAM {
+                self.pattern[f * ch + c] += delta * seam_weight(f);
+            }
+        }
+        self.phase = 0;
+    }
+
+    /// The pitch period of the recent output (frames), by autocorrelation.
+    /// Noise-like audio has no clear period: loop 10 ms of it instead.
+    fn pitch_period(&mut self) -> usize {
+        let ch = self.channels;
+        self.mono.clear();
+        self.mono.extend((0..HIST_FRAMES).map(|f| self.hist[f * ch..(f + 1) * ch].iter().sum::<f32>()));
+        let m = &self.mono;
+        let tail = &m[HIST_FRAMES - MATCH..];
+        let tail_energy: f32 = tail.iter().map(|x| x * x).sum();
+        if tail_energy < 1e-9 {
+            return 480;
+        }
+        let mut best = (0.3f32, 480usize);
+        for p in MIN_PERIOD..=MAX_PERIOD {
+            let prev = &m[HIST_FRAMES - MATCH - p..HIST_FRAMES - p];
+            let (mut num, mut energy) = (0.0f32, 0.0f32);
+            for (a, b) in tail.iter().zip(prev) {
+                num += a * b;
+                energy += b * b;
+            }
+            let c = num / ((tail_energy * energy).sqrt() + 1e-12);
+            if c > best.0 {
+                best = (c, p);
+            }
+        }
+        best.1
+    }
+
+    /// Where channel `c` would go next if the output just carried on.
+    fn predicted(&self, c: usize) -> f32 {
+        let ch = self.channels;
+        let last = self.hist[(HIST_FRAMES - 1) * ch + c];
+        let prev = self.hist[(HIST_FRAMES - 2) * ch + c];
+        last + (last - prev)
+    }
+
+    /// Bends the start of `block` onto the output so far: no step between
+    /// the last sample played and the first new one.
+    fn join(&self, block: &mut [f32; N]) {
+        let ch = self.channels;
+        for c in 0..ch {
+            let delta = self.predicted(c) - block[c];
+            for f in 0..SEAM.min(N / ch) {
+                block[f * ch + c] += delta * seam_weight(f);
+            }
+        }
+    }
+
+    fn remember(&mut self, block: &[f32; N]) {
+        self.hist.copy_within(N.., 0);
+        let start = self.hist.len() - N;
+        self.hist[start..].copy_from_slice(block);
+    }
+}
+
+/// Raised-cosine weight of a seam correction: 1 at the join, 0 after
+/// [`SEAM`] frames, smooth throughout.
+fn seam_weight(f: usize) -> f32 {
+    0.5 * (1.0 + (std::f32::consts::PI * f as f32 / SEAM as f32).cos())
 }
 
 /// Linear gain ramp across an interleaved block.
@@ -287,10 +405,11 @@ mod tests {
         assert_eq!(jb.pop()[0], 3.0);
         let concealed = jb.pop();
         assert_eq!(jb.stats().lost, 1);
-        assert!(concealed[BLOCK - 1].abs() < 3.0);
-        // Back from concealment: fades in rather than jumping.
+        // Stands in at the same level, carrying on without a step.
+        assert!((concealed[0] - 3.0).abs() < 0.1 && (concealed[BLOCK - 1] - 3.0).abs() < 0.1, "{concealed:?}");
+        // Back from concealment: joins what was playing, then reaches the real audio.
         let back = jb.pop();
-        assert!(back[0] < 5.0 && (back[BLOCK - 1] - 5.0).abs() < 1e-4);
+        assert!((back[0] - 3.0).abs() < 0.2 && (back[BLOCK - 1] - 5.0).abs() < 1e-4, "{back:?}");
     }
 
     #[test]
@@ -310,6 +429,34 @@ mod tests {
             }
         }
         assert!(peak < MAX_DEPTH / 2, "a single stall maxed out the buffer");
+    }
+
+    /// A voice-like tone through lost packets and a stall: the output never
+    /// steps further between two samples than the tone itself does.
+    #[test]
+    fn concealment_has_no_clicks() {
+        let f0 = 170.0f32; // a pitch that 2.5 ms blocks don't divide
+        let sig = |n: usize| -> f32 {
+            let t = n as f32 / SAMPLE_RATE as f32;
+            (1..=5).map(|k| (2.0 * std::f32::consts::PI * k as f32 * f0 * t).sin() * 0.2 / k as f32).sum()
+        };
+        let natural = (1..48_000).map(|n| (sig(n) - sig(n - 1)).abs()).fold(0.0f32, f32::max);
+        let block = |s: u32| -> [f32; BLOCK] { std::array::from_fn(|i| sig(s as usize * BLOCK + i)) };
+
+        let mut jb = Jb::new(1);
+        let mut out = Vec::new();
+        for s in 0..600u32 {
+            let lost = s == 150 || s == 151 || s == 400;
+            let stalled = (300..304).contains(&s); // never arrive in time
+            if !lost && !stalled {
+                jb.push(s, block(s), s as u64 * 2500);
+            }
+            out.extend_from_slice(&jb.pop());
+        }
+        let gaps = jb.stats().lost + jb.stats().underruns;
+        assert!(gaps >= 3, "the scenario should conceal: {:?}", jb.stats());
+        let worst = out.windows(2).skip(BLOCK * 4).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < natural * 1.5, "worst step {worst} vs the tone's own {natural}");
     }
 
     #[test]
