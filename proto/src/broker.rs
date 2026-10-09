@@ -61,7 +61,7 @@ pub enum FromBroker {
     /// After [`ToBroker::Join`]: the address the broker sees us at.
     Welcome { observed: SocketAddr },
     /// The whole group, sent again whenever anything in it changes.
-    /// Channels are listed only while their owner is online.
+    /// Every channel of the group: they last until their owner deletes them.
     State { members: Vec<Member>, channels: Vec<ChannelEntry> },
     /// Something was refused; the connection stays up.
     Error(String),

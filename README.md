@@ -67,9 +67,9 @@ before: everyone on the network.
 Everyone starts in the **Lobby**. Channels belong to the group and are kept
 by the broker (on disk, so they survive restarts):
 
-- A channel is open while its creator is online; when they go offline it
-  disappears and its members drop back to the Lobby. It returns with them.
-- Only the creator can delete it.
+- A channel lasts until its creator deletes it, online or not: someone's PC
+  going to sleep doesn't empty a channel everyone else is talking in.
+- Only the creator can delete it; anyone in it then drops back to the Lobby.
 - You only hear and send voice to people in your channel. Audio flows directly
   between members, so channels add no latency.
 

@@ -97,9 +97,9 @@ impl Broker {
                 Member { id: *id, name: m.presence.name.clone(), addrs, channel: m.presence.channel }
             })
             .collect();
-        let channels: Vec<ChannelEntry> =
-            g.channels.iter().filter(|c| g.members.contains_key(&c.owner)).cloned().collect();
-        let state = FromBroker::State { members, channels };
+        // Every channel, owner online or not: a sleeping PC mustn't empty a
+        // channel everyone else is talking in.
+        let state = FromBroker::State { members, channels: g.channels.clone() };
         for m in g.members.values() {
             let _ = m.tx.send(state.clone());
         }
