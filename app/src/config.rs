@@ -35,6 +35,10 @@ pub struct Config {
     pub crosstalk_cancel: bool,
     /// Voice-profile driven noise gate on the microphone.
     pub noise_gate: bool,
+    /// Neural noise suppression on the microphone (no added delay).
+    pub noise_suppression: bool,
+    /// How deep it suppresses: 1 = as trained, 0 = not at all.
+    pub suppression_amount: f32,
     /// Friends group code (normalized). Empty: no group, LAN only.
     pub group_code: String,
     /// `host[:port]` of the broker; empty turns internet connections off.
@@ -75,6 +79,8 @@ impl Default for Config {
             echo_cancel: true,
             crosstalk_cancel: true,
             noise_gate: true,
+            noise_suppression: false,
+            suppression_amount: 1.0,
             group_code: String::new(),
             broker: DEFAULT_BROKER.into(),
             broker_pins: HashMap::new(),

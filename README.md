@@ -127,6 +127,15 @@ only learns from speech that is yours; incoming streams are never modified),
 and a soft limiter instead of hard clipping. Same-room friends always stay
 audible in your headphones.
 
+**Noise suppression** (opt-in, Settings): a small recurrent network (two
+128-unit GRUs, 850 KB of weights compiled in) predicts 32 band gains every
+2.5 ms from the last 21 ms of mic audio, and a minimum-phase FIR filter built
+from those gains cleans the same block, crossfading from the previous filter.
+It never waits for future samples, so it adds no latency; at full gain it is
+an exact passthrough. It costs about 60 µs per block. Training (Python,
+PyTorch, DNS Challenge speech and noise) lives in `train/`; see
+`train/README.md`.
+
 ## Screen sharing
 
 Windows Graphics Capture (a whole screen or a single window, cursor

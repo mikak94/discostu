@@ -5,6 +5,7 @@
 //! chains that only steer gains and filter alignment.
 
 pub mod delay;
+pub mod denoise;
 pub mod echo;
 pub mod nlms;
 pub mod profile;
