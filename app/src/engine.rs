@@ -207,6 +207,8 @@ pub struct Snapshot {
     pub echo_cancel: bool,
     pub crosstalk_cancel: bool,
     pub noise_gate: bool,
+    pub noise_suppression: bool,
+    pub suppression_amount: f32,
     pub share_audio: bool,
     pub stream_volume: f32,
     /// Top of the per-person volume sliders.
@@ -255,6 +257,8 @@ impl Engine {
                 echo_cancel: cfg.echo_cancel,
                 crosstalk_cancel: cfg.crosstalk_cancel,
                 noise_gate: cfg.noise_gate,
+                noise_suppression: cfg.noise_suppression,
+                suppression_amount: cfg.suppression_amount,
                 profile_path: Config::dir().join(profile_file("voice-profile", "json")),
             },
         );
@@ -793,6 +797,15 @@ impl Engine {
         cfg.save();
     }
 
+    /// How deep noise suppression cuts (0..1).
+    pub fn set_suppression_amount(&self, amount: f32) {
+        let amount = amount.clamp(0.0, 1.0);
+        self.audio.suppression_amount.store(amount);
+        let mut cfg = self.cfg.lock();
+        cfg.suppression_amount = amount;
+        cfg.save();
+    }
+
     pub fn set_stream_volume(&self, v: f32) {
         self.audio.stream_volume.store(v);
         let mut cfg = self.cfg.lock();
@@ -806,6 +819,7 @@ impl Engine {
             Toggle::EchoCancel => (&mut cfg.echo_cancel, &self.audio.echo_cancel),
             Toggle::CrosstalkCancel => (&mut cfg.crosstalk_cancel, &self.audio.crosstalk_cancel),
             Toggle::NoiseGate => (&mut cfg.noise_gate, &self.audio.noise_gate),
+            Toggle::NoiseSuppression => (&mut cfg.noise_suppression, &self.audio.noise_suppression),
         };
         *field = on;
         atomic.store(on, Ordering::Relaxed);
@@ -985,6 +999,8 @@ impl Engine {
             echo_cancel: cfg.echo_cancel,
             crosstalk_cancel: cfg.crosstalk_cancel,
             noise_gate: cfg.noise_gate,
+            noise_suppression: cfg.noise_suppression,
+            suppression_amount: cfg.suppression_amount,
             share_audio: cfg.share_audio,
             stream_volume: cfg.stream_volume,
             max_volume: cfg.max_volume,
@@ -1002,6 +1018,7 @@ pub enum Toggle {
     EchoCancel,
     CrosstalkCancel,
     NoiseGate,
+    NoiseSuppression,
 }
 
 fn device_spec(cfg: &Config) -> DeviceSpec {

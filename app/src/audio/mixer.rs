@@ -10,6 +10,7 @@ use crossbeam_channel::Receiver;
 use rtrb::{Consumer, Producer};
 
 use super::device::DeviceIo;
+use super::dsp::denoise::Denoiser;
 use super::dsp::echo::{EchoCanceller, ramp};
 use super::dsp::profile::{self as voice, Analyzer, Bands, NoiseFloor, Vad, VoiceProfile};
 use super::dsp::talker::{Talker, TalkerDetector};
@@ -132,6 +133,9 @@ pub struct Mixer {
     cap_fifo: Vec<f32>,
     scratch: Vec<f32>,
     aec: EchoCanceller,
+    denoiser: Denoiser,
+    /// The denoiser ran last tick (off -> on starts it fresh).
+    denoise_on: bool,
     analyzer: Analyzer,
     noise: NoiseFloor,
     vad: Vad,
@@ -185,6 +189,8 @@ impl Mixer {
             scratch: Vec::with_capacity(4096),
             // 1024 taps = 21 ms of room tail after a bulk delay of up to 256 ms.
             aec: EchoCanceller::new(1024, 12288),
+            denoiser: Denoiser::new(),
+            denoise_on: false,
             analyzer: Analyzer::new(),
             noise: NoiseFloor::default(),
             vad: Vad::default(),
@@ -365,6 +371,20 @@ impl Mixer {
             let d = self.aec.stats().delay;
             sh.echo_delay_ms
                 .store(d.map_or(-1.0, |d| d as f32 * 1000.0 / SAMPLE_RATE as f32));
+        }
+
+        // 1b. Noise suppression (opt-in): a small network picks per-band gains
+        //     and a minimum-phase filter applies them to this very block, so
+        //     it adds no delay. Switching off runs one more block at zero
+        //     depth: the filter crossfades back to a passthrough, no click.
+        let denoise = flag(&sh.noise_suppression);
+        if denoise || self.denoise_on {
+            if !self.denoise_on {
+                self.denoiser.reset();
+            }
+            let amount = if denoise { sh.suppression_amount.load() } else { 0.0 };
+            self.denoiser.process(mic, amount);
+            self.denoise_on = denoise;
         }
 
         // 2. Analysis: noise floor, VAD, voice profile.

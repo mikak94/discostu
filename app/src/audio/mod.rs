@@ -151,6 +151,9 @@ pub struct AudioShared {
     pub echo_cancel: AtomicBool,
     pub crosstalk_cancel: AtomicBool,
     pub noise_gate: AtomicBool,
+    /// Neural noise suppression, and how deep (0..1).
+    pub noise_suppression: AtomicBool,
+    pub suppression_amount: AtomicF32,
     pub stream_volume: AtomicF32,
     /// Manual microphone gain (linear), set by the user for quiet mics.
     pub mic_gain: AtomicF32,
@@ -184,6 +187,8 @@ pub struct AudioSettings {
     pub echo_cancel: bool,
     pub crosstalk_cancel: bool,
     pub noise_gate: bool,
+    pub noise_suppression: bool,
+    pub suppression_amount: f32,
     pub stream_volume: f32,
     pub mic_gain_db: f32,
     pub profile_learning: bool,
@@ -203,6 +208,8 @@ impl AudioShared {
             echo_cancel: AtomicBool::new(settings.echo_cancel),
             crosstalk_cancel: AtomicBool::new(settings.crosstalk_cancel),
             noise_gate: AtomicBool::new(settings.noise_gate),
+            noise_suppression: AtomicBool::new(settings.noise_suppression),
+            suppression_amount: AtomicF32::new(settings.suppression_amount),
             stream_volume: AtomicF32::new(settings.stream_volume),
             mic_gain: AtomicF32::new(db_to_gain(settings.mic_gain_db)),
             profile_view: Mutex::new(ProfileView::default()),

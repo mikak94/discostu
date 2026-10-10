@@ -163,6 +163,7 @@ enum Message {
     MicChannel(Choice),
     MaxVolume(Choice),
     MicGain(f32),
+    SuppressionAmount(f32),
     Exclusive(bool),
     Toggle(Toggle, bool),
     ResetProfile,
@@ -507,6 +508,10 @@ impl App {
             }
             Message::MicGain(db) => {
                 engine.set_mic_gain_db(db);
+                self.refresh();
+            }
+            Message::SuppressionAmount(a) => {
+                engine.set_suppression_amount(a);
                 self.refresh();
             }
             Message::MaxVolume(c) => {
@@ -1360,6 +1365,35 @@ impl App {
         col.into()
     }
 
+    fn suppression(&self) -> El<'_> {
+        let s = &self.snap;
+        let switch = switch_row(
+            "Noise suppression",
+            "Removes fans, hum, keyboards and other background noise from your mic. Adds no delay.".into(),
+            s.noise_suppression,
+            Toggle::NoiseSuppression,
+        );
+        if !s.noise_suppression {
+            return switch;
+        }
+        let amount = s.suppression_amount;
+        column![
+            switch,
+            labeled(
+                "Strength",
+                row![
+                    slider(0.0..=1.0, amount, Message::SuppressionAmount).step(0.05f32).style(theme::volume),
+                    text(format!("{:.0}%", amount * 100.0)).size(12).color(MUTED).width(48),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into(),
+            ),
+        ]
+        .spacing(8)
+        .into()
+    }
+
     fn settings(&self) -> El<'_> {
         let s = &self.snap;
         let audio = self.audio_settings();
@@ -1372,6 +1406,7 @@ impl App {
         let voice = column![
             section("Voice processing"),
             switch_row("Echo cancellation", echo_note, s.echo_cancel, Toggle::EchoCancel),
+            self.suppression(),
             switch_row(
                 "Same-room separation",
                 "While someone in your room talks, your mic stays closed, so they never hear themselves come back.".into(),
