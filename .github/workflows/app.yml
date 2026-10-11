@@ -1,0 +1,64 @@
+# Tests and builds the Windows app. Every push to master that touches it
+# is published as release `build-N` (N = this workflow's run number) with
+# discostu.exe attached; running copies find it on their next launch and
+# update themselves (app/src/update.rs).
+name: App
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "app/**"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/app.yml"
+  pull_request:
+    paths:
+      - "app/**"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+# Builds publish in order: a newer push waits for the running one.
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # asio-sys downloads the ASIO SDK and needs libclang (preinstalled on
+      # the runner, see .cargo/config.toml).
+      - run: cargo test --locked -p discostu
+      - run: cargo build --locked --release -p discostu
+        env:
+          DISCOSTU_BUILD: ${{ github.run_number }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discostu-build-${{ github.run_number }}
+          path: target/release/discostu.exe
+
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: build-${{ github.run_number }}
+        run: |
+          git log -1 --format=%B > notes.txt
+          # A re-run of the same build replaces its exe.
+          gh release create "$TAG" target/release/discostu.exe \
+              --target "$GITHUB_SHA" --title "Build ${{ github.run_number }}" --notes-file notes.txt --latest \
+            || gh release upload "$TAG" target/release/discostu.exe --clobber

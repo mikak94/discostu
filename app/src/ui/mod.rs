@@ -177,6 +177,8 @@ enum Message {
     Escape,
     /// Native handle of our window, once it exists.
     WindowHandle(u64),
+    /// Close and start the downloaded update.
+    Restart,
 }
 
 /// Runs blocking backend work off the UI thread.
@@ -534,6 +536,10 @@ impl App {
                 engine.save_diagnostics();
                 self.toast("Saving the last 10 seconds of audio…");
             }
+            Message::Restart => {
+                crate::update::request_restart();
+                return iced::exit();
+            }
             Message::ProfileBand(band, db) => engine.edit_profile(ProfileEdit::SetBand(band, db)),
             Message::ProfileIgnore(band) => engine.edit_profile(ProfileEdit::ToggleIgnored(band)),
             Message::ProfileLearning(on) => {
@@ -690,7 +696,9 @@ impl App {
         }
 
         container(
-            column![header, Space::new().height(8), label, scrollable(list).height(Length::Fill), self.me_card()]
+            column![header]
+                .extend(self.update_button())
+                .extend([Space::new().height(8).into(), label.into(), scrollable(list).height(Length::Fill).into(), self.me_card()])
                 .spacing(10)
                 .padding(16),
         )
@@ -698,6 +706,19 @@ impl App {
         .height(Length::Fill)
         .style(theme::sidebar)
         .into()
+    }
+
+    /// "Restart to update" once a newer build has been downloaded.
+    fn update_button(&self) -> Option<El<'_>> {
+        let n = crate::update::ready()?;
+        Some(
+            button(text(format!("Build {n} is ready · Restart")).size(12))
+                .padding([7, 12])
+                .width(Length::Fill)
+                .style(theme::primary)
+                .on_press(Message::Restart)
+                .into(),
+        )
     }
 
     /// A channel header (click to join) with its members underneath.
@@ -1361,6 +1382,14 @@ impl App {
             ]
             .spacing(10)
             .align_y(Alignment::Center),
+        );
+        col = col.push(
+            text(match crate::update::build() {
+                Some(n) => format!("discostu build {n} · updates itself on launch"),
+                None => "discostu local build · doesn't update itself".into(),
+            })
+            .size(11)
+            .color(FAINT),
         );
         col.into()
     }

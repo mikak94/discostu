@@ -21,6 +21,7 @@ mod net;
 mod protocol;
 mod screen;
 mod ui;
+mod update;
 
 fn main() -> iced::Result {
     clock::init();
@@ -39,7 +40,10 @@ fn main() -> iced::Result {
         headless::run(&args);
         return Ok(());
     }
+    update::wait_for_previous(&args);
+    update::spawn();
     let result = ui::run();
     engine::shutdown_running();
+    update::finish();
     result
 }

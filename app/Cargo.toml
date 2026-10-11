@@ -31,6 +31,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bytemuck = { version = "1", features = ["derive"] }
 thread-priority = "3"
 futures = "0.3"
+ureq = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Media", "Win32_System_LibraryLoader"] }
