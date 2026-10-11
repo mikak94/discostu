@@ -6,6 +6,7 @@
 //! swaps it in (Windows lets a running exe be renamed, just not replaced).
 //! The new build runs from the next start, or right away via Restart.
 //! Local builds have no number and never update themselves.
+//! (Build 2 exists to test the update path.)
 
 use std::fs;
 use std::io;
