@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::audio::jitter::JitterStats;
 use crate::audio::{
-    AudioSettings, AudioShared, DeviceSpec, DeviceStatus, Driver, NetStats, PeerAudio, ProfileEdit, ProfileView,
+    AudioSettings, AudioShared, Cue, DeviceSpec, DeviceStatus, Driver, NetStats, PeerAudio, ProfileEdit, ProfileView,
 };
 use crate::config::Config;
 use crate::net::{self, Link, portmap::PortMap, quic};
@@ -35,6 +35,9 @@ pub struct Peer {
     /// Where their packets come from (LAN, public, or mapped address).
     pub addr: SocketAddr,
     pub status: Mutex<PeerStatus>,
+    /// Their status has arrived: until then `status.channel` says lobby
+    /// whether they're there or not.
+    heard: AtomicBool,
     pub conn: quinn::Connection,
     ctrl: mpsc::UnboundedSender<Ctrl>,
     /// Which side opened this connection (for duplicate resolution).
@@ -123,6 +126,9 @@ pub struct Engine {
     portmap: Mutex<PortMap>,
     /// What the broker last heard from us.
     last_presence: Mutex<Option<Presence>>,
+    /// Our channel and who was in it at the last reroute, to play the
+    /// enter/leave sounds when that changes.
+    company: Mutex<(Option<ChannelRef>, HashSet<PeerId>)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -287,6 +293,7 @@ impl Engine {
             pending_channels: Mutex::new(Vec::new()),
             portmap: Mutex::new(PortMap::Trying),
             last_presence: Mutex::new(None),
+            company: Mutex::new((None, HashSet::new())),
         });
         quic::spawn_accept(engine.clone());
         net::media::spawn_pinger(engine.clone());
@@ -358,19 +365,25 @@ impl Engine {
     ) -> Option<Arc<Peer>> {
         let preferred = self.me.min(id);
         let mut peers = self.peers.write();
+        let mut status = PeerStatus { name: name.to_string(), ..Default::default() };
+        let mut heard = false;
         if let Some(existing) = peers.get(&id) {
             // Both sides apply the same rule, so they keep the same connection.
             if existing.initiator == preferred && initiator != preferred {
                 return None;
             }
             existing.close();
+            // Same person, new connection: they haven't gone anywhere.
+            status = existing.status.lock().clone();
+            heard = existing.heard.load(Ordering::Relaxed);
         }
         let volume = self.cfg.lock().peer_volumes.get(&id).copied().unwrap_or(1.0);
         let audio = self.audio.add_peer(id, Link(conn.clone()), volume);
         let peer = Arc::new(Peer {
             id,
             addr: quic::remote_addr(&conn),
-            status: Mutex::new(PeerStatus { name: name.to_string(), ..Default::default() }),
+            status: Mutex::new(status),
+            heard: AtomicBool::new(heard),
             conn,
             ctrl,
             initiator,
@@ -409,6 +422,7 @@ impl Engine {
         let stopped_sharing = status.sharing.is_none();
         if let Some(p) = self.peers.read().get(&id) {
             *p.status.lock() = status;
+            p.heard.store(true, Ordering::Relaxed);
         }
         self.reroute();
         if stopped_sharing {
@@ -650,8 +664,26 @@ impl Engine {
             *self.channel.lock() = None;
             *self.notice.lock() = Some("The channel was deleted by the person who made it. You're back in the lobby.".into());
         }
-        for p in self.peers.read().values() {
-            p.audio.set_in_channel(p.status.lock().channel == here);
+        {
+            let mut company = self.company.lock();
+            let peers = self.peers.read();
+            let mut with_us = HashSet::new();
+            for p in peers.values() {
+                let in_channel = p.status.lock().channel == here;
+                p.audio.set_in_channel(in_channel);
+                if in_channel && p.heard.load(Ordering::Relaxed) {
+                    with_us.insert(p.id);
+                }
+            }
+            // Our own moves change who's around without anyone coming or going.
+            if company.0 == here {
+                if with_us.iter().any(|id| !company.1.contains(id)) {
+                    self.audio.play_cue(Cue::Enter);
+                } else if company.1.iter().any(|id| !with_us.contains(id)) {
+                    self.audio.play_cue(Cue::Leave);
+                }
+            }
+            *company = (here, with_us);
         }
         if here != current {
             self.broadcast_status();

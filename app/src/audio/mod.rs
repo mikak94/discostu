@@ -7,10 +7,12 @@
 //!                                                      └─► crosstalk reference
 //!  peer voice ─► jitter ─► crosstalk cancel ─► residual suppress ─► gain ─┐
 //!  peer screen audio (stereo) ─► jitter ─► stream volume ───────────────┐ │
-//!                                                              mix ◄────┴─┘
+//!  enter/leave sounds ────────────────────────────────────────────────┐ │ │
+//!                                                              mix ◄──┴─┴─┘
 //!  mix ─► limiter ─► drift-corrected resampler ─► playback ─► speakers
 //! ```
 
+mod cues;
 pub mod device;
 pub mod dsp;
 pub mod jitter;
@@ -24,7 +26,7 @@ mod resample;
 
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -32,6 +34,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::clock;
 use crate::protocol::{self, BLOCK, PeerId};
+pub use cues::Cue;
 pub use device::{DeviceSpec, DeviceStatus, Driver};
 use jitter::{JitterBuffer, JitterStats};
 
@@ -180,6 +183,8 @@ pub struct AudioShared {
     /// Set by the UI: save the diagnostic recording now.
     snapshot_request: AtomicBool,
     snapshot_result: Mutex<Option<Result<PathBuf, String>>>,
+    /// Notification sound to start on the next DSP tick (0 = none).
+    cue: AtomicU8,
 }
 
 pub struct AudioSettings {
@@ -229,6 +234,7 @@ impl AudioShared {
             profile_path: settings.profile_path,
             snapshot_request: AtomicBool::new(false),
             snapshot_result: Mutex::new(None),
+            cue: AtomicU8::new(0),
         });
 
         let s = shared.clone();
@@ -326,6 +332,10 @@ impl AudioShared {
 
     pub fn take_snapshot_result(&self) -> Option<Result<PathBuf, String>> {
         self.snapshot_result.lock().take()
+    }
+
+    pub fn play_cue(&self, cue: Cue) {
+        self.cue.store(cue as u8, Ordering::Relaxed);
     }
 
     pub fn edit_profile(&self, edit: ProfileEdit) {

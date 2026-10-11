@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use rtrb::{Consumer, Producer};
 
+use super::cues::{Cue, CuePlayer};
 use super::device::DeviceIo;
 use super::dsp::denoise::Denoiser;
 use super::dsp::echo::{EchoCanceller, ramp};
@@ -162,6 +163,7 @@ pub struct Mixer {
     /// Mono sum of what went to the speakers last tick (AEC reference).
     last_mix: Block,
     peers: HashMap<PeerId, PeerDsp>,
+    cues: CuePlayer,
     seq: u32,
     packet: Vec<u8>,
     clock_start: Instant,
@@ -209,6 +211,7 @@ impl Mixer {
             learn_ok: true,
             last_mix: [0.0; BLOCK],
             peers: HashMap::new(),
+            cues: CuePlayer::new(),
             seq: 0,
             packet: Vec::with_capacity(protocol::MAX_DATAGRAM),
             clock_start: Instant::now(),
@@ -451,7 +454,7 @@ impl Mixer {
 
         let rms = (energy(mic) / BLOCK as f32).sqrt();
         sh.local_level.store(rms);
-        sh.local_voice.store(open && speaking, Ordering::Relaxed);
+        sh.local_voice.store(live && open && speaking, Ordering::Relaxed);
 
         // 4. Send to everyone. Muted still sends silence so peers' jitter
         //    buffers stay primed and unmuting is instant.
@@ -603,7 +606,12 @@ impl Mixer {
         self.roommate_talking = self.roommate_hold > 0;
         self.learn_ok = learn_ok;
 
-        // 6. Soft limiter, then playback.
+        // 6. Enter/leave sounds, soft limiter, then playback. The sounds are
+        //    part of the AEC reference like everything else we play.
+        if let Some(cue) = Cue::from_u8(sh.cue.swap(0, Ordering::Relaxed)) {
+            self.cues.play(cue);
+        }
+        self.cues.mix(&mut mix);
         soft_limit(&mut mix);
         if flag(&sh.deafened) {
             mix = [0.0; STEREO_BLOCK];
