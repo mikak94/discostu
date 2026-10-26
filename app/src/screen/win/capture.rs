@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::core::{IInspectable, Interface, Result};
+use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
 use super::d3d::{D3d, SendCell};
 
@@ -52,6 +53,16 @@ pub fn item_for(target: Target) -> Result<GraphicsCaptureItem> {
     }
 }
 
+pub fn check_target_alive(target: Target) -> bool {
+    match target {
+        Target::Monitor(_) => true,
+        Target::Window(id) => {
+            let target_hwnd = HWND(id as _);
+            unsafe { !IsWindow(Some(target_hwnd)).as_bool() }
+        },
+    }
+}
+
 impl Wgc {
     /// `on_frame(texture, content_width, content_height)` runs on a capture
     /// thread for every presented frame.
@@ -73,10 +84,29 @@ impl Wgc {
 
         let closed = Arc::new(AtomicBool::new(false));
         let c = closed.clone();
-        item.Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
-            c.store(true, Ordering::Relaxed);
-            Ok(())
-        }))?;
+        // this does not work for some reason
+        // item.Closed(&TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
+        //     c.store(true, Ordering::Relaxed);
+        //     Ok(())
+        // }))?;
+
+        std::thread::spawn({
+            move || {
+                loop {
+                    if !check_target_alive(target) {
+                        c.store(true, Ordering::Relaxed);
+                        println!("Target window was closed by user or crashed.");
+                        break;
+                    }
+
+                    if c.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                }
+            }
+        });
 
         let pool_size = std::sync::Mutex::new(size);
         let rt = SendCell(rt);
