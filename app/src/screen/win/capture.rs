@@ -58,7 +58,7 @@ pub fn check_target_alive(target: Target) -> bool {
         Target::Monitor(_) => true,
         Target::Window(id) => {
             let target_hwnd = HWND(id as _);
-            unsafe { !IsWindow(Some(target_hwnd)).as_bool() }
+            unsafe { IsWindow(Some(target_hwnd)).as_bool() }
         },
     }
 }
