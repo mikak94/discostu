@@ -336,7 +336,9 @@ impl Engine {
     }
 
     fn broadcast_status(&self) {
-        let msg = Ctrl::Status(self.local_status());
+        let ls = self.local_status();
+        println!("local status {:?}", &ls);
+        let msg = Ctrl::Status(ls);
         for p in self.peers.read().values() {
             p.send(&msg);
         }
@@ -969,7 +971,23 @@ impl Engine {
         }
     }
 
+    /// Drops a share whose source went away (e.g. the window closed) and tells
+    /// peers. Safe to call often: it only broadcasts once per dead share.
+    pub fn reap_share(&self) {
+        // Release the lock before announcing: `local_status` reads `share` too.
+        let dead = {
+            let mut s = self.share.lock();
+            if s.as_ref().is_some_and(|h| h.is_stopped()) { s.take() } else { None }
+        };
+        if let Some(hub) = dead {
+            hub.stop(); // only if it's idempotent; otherwise drop this line
+            self.notify("The shared window was closed.".into());
+            self.broadcast_status();
+        }
+    }
+
     pub fn snapshot(&self) -> Snapshot {
+        self.reap_share();
         let a = &self.audio;
         let hub = self.share_hub();
         let echo_delay = a.echo_delay_ms.load();
